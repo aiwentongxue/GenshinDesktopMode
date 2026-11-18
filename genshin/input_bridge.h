@@ -6,6 +6,7 @@
 #include "keyboard_state.h"
 #include "hardware_state.h"
 #include "scroll_state.h"
+#include "screen_metrics.h"
 #include "wheel_zoom_policy.h"
 
 namespace NativeBridge {
@@ -30,7 +31,6 @@ static std::atomic<uint32_t> handoffMouseBlocked{0};
 static void (*stopControllerFeedback)(void);
 // Read-only device activity is sampled after the native update has returned;
 // mode rebuilding is queued outside this engine call.
-static void (*observeControlFrame)(bool foreground);
 // Sample the latest OS position once before Unity consumes this frame's input.
 static void (*sampleDesktopPointer)(void);
 // Observe the original AppKit dispatch before local monitors may consume Esc.
@@ -54,21 +54,7 @@ static uint32_t (*scrollZoomReader)(void);
 // Read only the live interaction list, on pending world-wheel input. The
 // callback is outside the input mutex and never selects or activates a row.
 static bool (*interactionWheelContext)(void);
-static std::atomic<bool> interactionWheelDiscrete{false};
-static std::atomic<bool> interactionWheelFresh{false};
-static void CheckInteractionWheelOnMain(void) {
-    if(!NSThread.isMainThread || !interactionWheelContext) return;
-    interactionWheelDiscrete.store(interactionWheelContext(),std::memory_order_relaxed);
-    interactionWheelFresh.store(true,std::memory_order_relaxed);
-}
-static void RequestInteractionWheelCheck(void) {
-    static std::atomic<bool> queued{false};
-    if(queued.exchange(true)) return;
-    dispatch_async(dispatch_get_main_queue(),^{
-        queued.store(false);
-        CheckInteractionWheelOnMain();
-    });
-}
+static bool packetUsesInteractionWheel=false; // protected by mutex
 static float normalizedX,normalizedY;
 static bool hasPointerPosition;
 static bool IsKeyHeld(int key) {
@@ -77,20 +63,10 @@ static bool IsKeyHeld(int key) {
 }
 static int (*screenWidth)(void *),(*screenHeight)(void *);
 static void *screenWidthMethod,*screenHeightMethod;
-// Unity's Screen getters are managed calls. Read them on the main thread and
-// hand the engine input thread plain cached scalars instead of invoking
-// IL2CPP twice per frame from a worker.
-static std::atomic<int> cachedScreenWidth{0},cachedScreenHeight{0};
-static int ScreenWidthValue(void) {return cachedScreenWidth.load(std::memory_order_relaxed);}
-static int ScreenHeightValue(void) {return cachedScreenHeight.load(std::memory_order_relaxed);}
-static void RefreshScreenMetrics(void) {
-    if(!NSThread.isMainThread || !screenWidth || !screenHeight ||
-       !screenWidthMethod || !screenHeightMethod) return;
-    int width=screenWidth(screenWidthMethod),height=screenHeight(screenHeightMethod);
-    if(width>0 && height>0) {
-        cachedScreenWidth.store(width,std::memory_order_relaxed);
-        cachedScreenHeight.store(height,std::memory_order_relaxed);
-    }
+static DesktopScreenMetrics screenMetrics;
+static void RefreshScreenMetrics() {
+    if (screenWidth && screenHeight)
+        screenMetrics.publish(screenWidth(screenWidthMethod),screenHeight(screenHeightMethod));
 }
 static std::atomic<uint64_t> frames{0}, forwardedKeys{0}, forwardedMouseFrames{0};
 static std::atomic<uint64_t> gameActionFrames{0};
@@ -135,17 +111,30 @@ static void Deactivate(void) {
 static void Move(float x,float y) {
     std::lock_guard<std::mutex> guard(mutex);if(keyboard.active){deltaX+=x;deltaY+=y;}
 }
+static bool PacketUsesInteractionWheel(uint32_t target) {
+    return target==1 && interactionWheelContext && interactionWheelContext();
+}
 static void Scroll(float x,float y) {
+    if(!x && !y) return;
+    if(!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(),^{Scroll(x,y);});
+        return;
+    }
+    bool discrete=PacketUsesInteractionWheel(scrollContextReader?scrollContextReader():1);
     std::lock_guard<std::mutex> guard(mutex);
     if(keyboard.active && !nativeOverlayActive) {
         double now=CACurrentMediaTime();
+        packetUsesInteractionWheel=discrete;
         scroll.hardware(x,y,now);
     }
 }
 static void SystemScroll(const DesktopScrollDispatchScope::Key &event,uint32_t target,bool mosMarked,double linesX=0,double linesY=0) {
+    bool discrete=PacketUsesInteractionWheel(target);
     std::lock_guard<std::mutex> guard(mutex);
-    if(keyboard.active && !nativeOverlayActive)
+    if(keyboard.active && !nativeOverlayActive) {
+        packetUsesInteractionWheel=discrete;
         scroll.system(event.stamp,CACurrentMediaTime(),event.x,event.y,event.precise,event.phase,event.momentum,target,mosMarked,linesX,linesY);
+    }
 }
 static void CancelCoarseWheel(void) {
     std::lock_guard<std::mutex> guard(mutex);scroll.cancelCoarse();
@@ -185,19 +174,7 @@ static void Update(char *manager) {
     uint32_t wheelContext=foreground && !nativeOverlayActive?
         (scrollContextReader?scrollContextReader():1):0;
     uint32_t zoomContext=wheelContext && scrollZoomReader?scrollZoomReader():0;
-    bool interactionChecked=false;
-    if(wheelContext==1 && interactionWheelContext) {
-        bool pending=false;
-        {std::lock_guard<std::mutex> guard(mutex);pending=scroll.hasPendingInput();}
-        if(pending) {
-            // Interaction panels are Unity objects and may only be inspected
-            // on the main thread. Use the snapshot taken at event time; a
-            // path that bypassed the event monitor defers one frame while
-            // the main queue refreshes it.
-            if(interactionWheelFresh.exchange(false)) interactionChecked=true;
-            else RequestInteractionWheelCheck();
-        }
-    } else {interactionWheelDiscrete.store(false);interactionWheelFresh.store(false);}
+    bool interactionWheelDiscrete;
     auto physical=KeyboardSnapshot(foreground);
     NSUInteger rawMouse=((NSUInteger (*)(id,SEL))objc_msgSend)(NSClassFromString(@"NSEvent"),sel_registerName("pressedMouseButtons"));
     physicalMouseSnapshot=(uint32_t)rawMouse;
@@ -223,12 +200,8 @@ static void Update(char *manager) {
         x=deltaX;y=deltaY;
         // A map/list/world transition cancels an ordinary wheel's short tail
         // before the newly opened view can consume it. Mos keeps its route.
-        // An event can arrive during the read-only context check. If this
-        // frame has not checked a world event, leave it queued for the next
-        // frame instead of smoothing its first notch with a stale context.
-        bool defer=wheelContext==1 && interactionWheelContext && !interactionChecked && scroll.hasPendingInput();
-        auto wheel=defer?DesktopWheelRouter::Delta{}:
-            scroll.frame(CACurrentMediaTime(),wheelContext,wheelContext|((uint64_t)zoomContext<<32),interactionWheelDiscrete);
+        interactionWheelDiscrete=wheelContext==1 && packetUsesInteractionWheel;
+        auto wheel=scroll.frame(CACurrentMediaTime(),wheelContext,wheelContext|((uint64_t)zoomContext<<32),interactionWheelDiscrete);
         mosScroll=scroll.usingMos();
         sx=(float)wheel.x;sy=(float)wheel.y;
         px=normalizedX;py=normalizedY;positioned=hasPointerPosition;
@@ -294,15 +267,15 @@ static void Update(char *manager) {
             previousLeft=buttons[0];
         }
     }
-    if (mouseOwned && foreground && positioned && ScreenWidthValue()>0 && ScreenHeightValue()>0) {
+    const auto pixels=screenMetrics.read();
+    if (mouseOwned && foreground && positioned && pixels.width && pixels.height) {
         // One position drives both the visible cursor and Unity hit testing.
         // Camera motion uses the axis accumulators, never an unbounded second
         // absolute cursor that could reappear at a different location.
-        *(float *)(manager+0xd0)=px*ScreenWidthValue();
-        *(float *)(manager+0xd4)=py*ScreenHeightValue();
+        *(float *)(manager+0xd0)=px*pixels.width;
+        *(float *)(manager+0xd4)=py*pixels.height;
     }
     ++frames;
-    if(observeControlFrame) observeControlFrame(foreground);
     if (x || y || sx || sy) {
         auto frame=++forwardedMouseFrames;
         if (frame<=3 || frame%240==0) {

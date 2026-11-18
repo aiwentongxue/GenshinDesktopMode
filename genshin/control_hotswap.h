@@ -1,5 +1,4 @@
 #pragma once
-#include <atomic>
 #include "control_hotswap_state.h"
 #include "controller_identity.h"
 
@@ -22,16 +21,15 @@ static DesktopPointerIntent pointerIntent;
 static id eventMonitor;
 static bool installed,scheduled,focused;
 static bool disconnectFallbackPending;
-static double nextPoll;
-// Written by the engine input thread on focus changes and read on the main
-// queue during the gameplay probe; keep both fields atomic.
-static std::atomic<double> mainCheckTime{-100};
-static std::atomic<bool> mainReady{false};
+static NSTimer *pollTimer;
+static double mainCheckTime=-100;
+static bool mainReady;
 static const char *reason="none";
 static uint64_t committed;
 static void (*chatEvent)(id);
 static void (*chatControllerConfirm)(GCController *);
 static void QueueAttempt(void);
+static void SchedulePoll(void);
 
 static DesktopGamepadIntent::Sample Read(GDMControllerActivity *device) {
     GCExtendedGamepad *pad=device.controller.extendedGamepad;
@@ -50,20 +48,13 @@ static DesktopGamepadIntent::Sample Read(GDMControllerActivity *device) {
 static void Seed(void) {
     for(GDMControllerActivity *device in tracked) {device->intent.reset();device->intent.sample(Read(device));device->chatPressed=DesktopControllerIdentity::ChatButton(device.controller,device->playStation).pressed;}
 }
-static bool InLevelPageVisible(void) {
-    // Unity scene queries allocate and touch the managed heap. The engine
-    // input update that calls ObserveFrame is not the AppKit/Unity main
-    // thread, so those queries must never run there.
-    if(!NSThread.isMainThread) {
-        static bool reported=false;
-        if(!reported){reported=true;Log(@"scene_probe refused_off_main_thread=1");}
-        return false;
-    }
+static bool InLevelPageVisible(bool includeMenus) {
     void *go=findClass("UnityEngine.CoreModule.dll","UnityEngine","GameObject");
     void *find=go?lookup(go,"Find",1,0):nullptr;
     void *name=EngineFunction<void *(*)(const char *)>(0x10e9bb794)("InLevelMainPage");
     void *args[]={name};
     if(find&&Call(find,nullptr,args))return true;
+    if(!includeMenus)return false;
     // These verified page types also own in-level input while the main HUD is
     // hidden. Searches are bounded and run only during a pending mode change.
     static void *finder,*types[6];
@@ -83,41 +74,7 @@ static bool InLevelPageVisible(void) {
     }
     return false;
 }
-// The startup gate used to run GameObject.Find and six scene-wide
-// FindObjectsOfType scans on the engine input thread, which crashed inside
-// IL2CPP and hitched the frame. Probe on the main queue instead, at a lower
-// rate, and keep the same page set the native mode switch relies on.
-static std::atomic<bool> gameplayProbeInFlight{false};
-static std::atomic<double> gameplayProbeEarliest{0};
-static void GameplayProbeOnMain(void) {
-    gameplayProbeInFlight.store(false);
-    if(!DesktopControlPreference::bootstrapReady.load() ||
-       DesktopControlPreference::gameplayReady.load() ||
-       NativeBridge::nativeOverlayActive || !NativeBridge::IsForeground()) return;
-    mainCheckTime=CACurrentMediaTime();
-    mainReady=InLevelPageVisible();
-    if(!mainReady)return;
-    DesktopControlPreference::gameplayReady=true;
-    dispatch_async(dispatch_get_main_queue(),^{
-        char *owner=VerifiedInputOwner();
-        if(owner)DesktopUIGeometry::After(*(int *)(owner+GenshinOffsets().ownerInputMode));
-    });
-    Log(@"desktop_controller_startup gameplay_ready=1 login_completed=1 saved_mode=%d",
-        DesktopControlPreference::SavedMode());
-}
-static void QueueGameplayProbe(void) {
-    double now=CACurrentMediaTime();
-    if(now<gameplayProbeEarliest.load(std::memory_order_relaxed))return;
-    gameplayProbeEarliest.store(now+0.5,std::memory_order_relaxed);
-    if(gameplayProbeInFlight.exchange(true))return;
-    dispatch_async(dispatch_get_main_queue(),^{GameplayProbeOnMain();});
-}
 static bool NativeReady(int mode,double now) {
-    // Mode switches rebuild managed input pages and must stay on the main
-    // queue even if a future caller forgets to hop there first.
-    if(!NSThread.isMainThread) {
-        Log(@"control_hot_swap refused_off_main_thread=1 mode=%d",mode);return false;
-    }
     DesktopHotSwapContext context;
     context.initialized=DesktopControlPreference::bootstrapReady.load()&&DesktopUI::beforeInputSwitch&&
         DesktopUI::afterInputSwitch&&NativeBridge::frames.load();
@@ -128,7 +85,7 @@ static bool NativeReady(int mode,double now) {
     if(mode==3) {
         context.physicalController=tracked.count!=0;
         if(!context.physicalController)return false;
-        if(now-mainCheckTime>=.2) {mainCheckTime=now;mainReady=InLevelPageVisible();}
+        if(now-mainCheckTime>=.2) {mainCheckTime=now;mainReady=InLevelPageVisible(true);}
         context.gameplayPage=mainReady;
         char *game=*(char **)(owner+GenshinOffsets().ownerGameInput);
         void *player=game?*(void **)(game+GenshinOffsets().inputPlayer):nullptr;
@@ -196,6 +153,7 @@ static void RefreshControllers(void) {
         device->intent.sample(Read(device));device->chatPressed=DesktopControllerIdentity::ChatButton(controller,device->playStation).pressed;[next addObject:device];
     }
     tracked=[next copy];
+    if(!pollTimer || hadController!=(tracked.count!=0)) SchedulePoll();
     DesktopControllerIdentity::Refresh();
     if(hadController&&!tracked.count) {
         pending.cancel();ControllerHaptics::Stop();
@@ -204,39 +162,52 @@ static void RefreshControllers(void) {
     }
     Log(@"control_hot_swap connected=%lu snapshots_ignored=1 native_handlers_preserved=1",(unsigned long)tracked.count);
 }
-static void ExplicitSelection(int) {
+static void ExplicitSelection(int mode) {
+    if(!NSThread.isMainThread) {dispatch_async(dispatch_get_main_queue(),^{ExplicitSelection(mode);});return;}
     pending.manual(CACurrentMediaTime());pointerIntent.reset();Seed();
 }
-static void ObserveFrame(bool active) {
-    ControllerHaptics::ObserveForeground(active);
+static void PollOnMain(bool active) {
     if(focused!=active) {
         focused=active;if(!active)pending.cancel();pointerIntent.reset();Seed();
         mainCheckTime=-100;mainReady=false;
     }
-    if(active&&DesktopControlPreference::bootstrapReady.load()&&!DesktopControlPreference::gameplayReady.load())
-        QueueGameplayProbe();
+    if(active&&DesktopControlPreference::bootstrapReady.load()&&!DesktopControlPreference::gameplayReady.load()) {
+        double now=CACurrentMediaTime();
+        if(now-mainCheckTime>=.2){mainCheckTime=now;mainReady=InLevelPageVisible(false);
+            if(mainReady){DesktopControlPreference::gameplayReady=true;
+                dispatch_async(dispatch_get_main_queue(),^{char *owner=VerifiedInputOwner();if(owner)DesktopUIGeometry::After(*(int *)(owner+GenshinOffsets().ownerInputMode));});
+                Log(@"desktop_controller_startup gameplay_ready=1 login_completed=1 saved_mode=%d",DesktopControlPreference::SavedMode());}}
+    }
     if(active&&disconnectFallbackPending)
         if(Request(2,"controller_disconnected",false,true))disconnectFallbackPending=false;
     if(!active || (!tracked.count&&!pending.pending))return;
-    double now=CACurrentMediaTime();
-    if(now>=nextPoll) {
-        nextPoll=now+1./120.;
-        for(GDMControllerActivity *device in tracked) {
-            bool pressed=DesktopControllerIdentity::ChatButton(device.controller,device->playStation).pressed;
-            bool freshChat=pressed&&!device->chatPressed;device->chatPressed=pressed;
-            bool intentional=device->intent.sample(Read(device));
-            // Capture the currently open chat before a queued mode handoff
-            // rebuilds it. The focus callback itself runs on the main queue.
-            if(freshChat&&!NativeBridge::nativeOverlayActive&&chatControllerConfirm)
-                chatControllerConfirm(device.controller);
-            if(intentional&&!NativeBridge::nativeOverlayActive) {
-                DesktopControllerIdentity::Select(device.controller,device->playStation);
-                ControllerHaptics::RefreshController(device.controller);
-                Request(3,"gamepad");
-            }
+    for(GDMControllerActivity *device in tracked) {
+        bool pressed=DesktopControllerIdentity::ChatButton(device.controller,device->playStation).pressed;
+        bool freshChat=pressed&&!device->chatPressed;device->chatPressed=pressed;
+        bool intentional=device->intent.sample(Read(device));
+        // Capture the currently open chat before a queued mode handoff
+        // rebuilds it. The focus callback itself runs on the main queue.
+        if(freshChat&&!NativeBridge::nativeOverlayActive&&chatControllerConfirm)
+            chatControllerConfirm(device.controller);
+        if(intentional&&!NativeBridge::nativeOverlayActive) {
+            DesktopControllerIdentity::Select(device.controller,device->playStation);
+            ControllerHaptics::RefreshController(device.controller);
+            Request(3,"gamepad");
         }
     }
     QueueAttempt();
+}
+// AppKit delivers device events and owns the game UI on this run loop. Unity
+// may run its input callback on a job thread while this UI is being rebuilt.
+static void SchedulePoll(void) {
+    [pollTimer invalidate];
+    NSTimeInterval interval=tracked.count ? 1.0/120.0 : .2;
+    pollTimer=[NSTimer timerWithTimeInterval:interval repeats:YES block:^(NSTimer *) {
+        bool active=NativeBridge::IsForeground();
+        ControllerHaptics::ObserveForeground(active);
+        PollOnMain(active);
+    }];
+    [NSRunLoop.mainRunLoop addTimer:pollTimer forMode:NSRunLoopCommonModes];
 }
 static id ObserveEvent(id event) {
     if(!NativeBridge::IsForeground()||!NativeGameWindow()||NativeBridge::nativeOverlayActive)return event;
@@ -291,7 +262,6 @@ static void ObserveBatchedMapMotion(double x,double y) {
 static void Install(void) {
     if(installed||!IsCompatibleRuntime())return;
     installed=true;
-    NativeBridge::observeControlFrame=ObserveFrame;
     NativeBridge::observeDesktopEvent=ObserveDispatch;
     NativeBridge::canBatchMapMotion=CanBatchMapMotion;
     NativeBridge::observeBatchedMapMotion=ObserveBatchedMapMotion;
@@ -312,7 +282,7 @@ static void Install(void) {
         eventMonitor=((id (*)(id,SEL,uint64_t,id))objc_msgSend)(NSClassFromString(@"NSEvent"),
             sel_registerName("addLocalMonitorForEventsMatchingMask:handler:"),mask,handler);
     }
-    Log(@"control_hot_swap installed=1 application_dispatch=%d fallback_monitor=%d input_handlers_replaced=0 default=last_used controller_ingame_gate=1 keyboard_menu_return=1",
+    Log(@"control_hot_swap installed=1 application_dispatch=%d fallback_monitor=%d input_handlers_replaced=0 default=last_used controller_ingame_gate=1 keyboard_menu_return=1 poll_owner=main_runloop",
         originalApplicationSendEvent!=nullptr,eventMonitor!=nil);
 }
 }

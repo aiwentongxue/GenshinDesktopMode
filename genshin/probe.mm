@@ -302,7 +302,6 @@ __attribute__((constructor)) static void InitializeProbe(void) {
             for (GCMouse *mouse in GCMouse.mice) AttachMouse(mouse);
             Log(@"main_queue_alive windows=%lu", (unsigned long)UIApplication.sharedApplication.windows.count);
             [NSTimer scheduledTimerWithTimeInterval:5 repeats:YES block:^(NSTimer *) {
-                NativeBridge::RefreshScreenMetrics();
                 ConfigureGamePresentation();
                 Log(@"heartbeat keyboard=%u mouse=%u frames=%llu forwarded_keys=%llu forwarded_mouse_frames=%llu action_frames=%llu repairs=%llu hardware_differences=%llu windows=%lu", keyboardEvents, mouseEvents,
                     NativeBridge::frames.load(),NativeBridge::forwardedKeys.load(),NativeBridge::forwardedMouseFrames.load(),

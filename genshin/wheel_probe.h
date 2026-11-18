@@ -49,9 +49,10 @@ static void Install(void) {
         if(!NativeBridge::IsKeyHeld(9)) return;
         for(void *cls:classes) InspectInstances(cls);
         float px,py;{std::lock_guard<std::mutex> guard(NativeBridge::mutex);px=NativeBridge::normalizedX;py=NativeBridge::normalizedY;}
+        const auto [w,h]=NativeBridge::screenMetrics.read();
         Log(@"wheel_pointer normalized=(%.4f,%.4f) unity=(%.1f,%.1f) screen=(%d,%d)",px,py,
             *(float *)(nativeInputManager+0xd0),*(float *)(nativeInputManager+0xd4),
-            NativeBridge::ScreenWidthValue(),NativeBridge::ScreenHeightValue());
+            w,h);
     }];
 }
 }

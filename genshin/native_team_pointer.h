@@ -75,8 +75,7 @@ static void MouseFrame(void *object){
   !NativeBridge::nativeOverlayActive.load()&&DesktopControlPreference::gameplayReady.load()&&
   !pointerCaptureSuspended&&WantsVisibleCursor()&&NativeBridge::IsForeground();
  V2 p{nativeInputManager?*(float *)(nativeInputManager+0xd0):NAN,nativeInputManager?*(float *)(nativeInputManager+0xd4):NAN};
- int w=NativeBridge::ScreenWidthValue();
- int h=NativeBridge::ScreenHeightValue();
+ const auto [w,h]=NativeBridge::screenMetrics.read();
  bool inside=w>0&&h>0&&std::isfinite(p.x)&&std::isfinite(p.y)&&p.x>=0&&p.y>=0&&p.x<w&&p.y<h;
  bool fresh=held&&!drag.held,mayBegin=false;
 #ifdef GDM_TEAM_TRACE
