@@ -51,7 +51,7 @@ static void Install(void) {
         float px,py;{std::lock_guard<std::mutex> guard(NativeBridge::mutex);px=NativeBridge::normalizedX;py=NativeBridge::normalizedY;}
         Log(@"wheel_pointer normalized=(%.4f,%.4f) unity=(%.1f,%.1f) screen=(%d,%d)",px,py,
             *(float *)(nativeInputManager+0xd0),*(float *)(nativeInputManager+0xd4),
-            NativeBridge::screenWidth(NativeBridge::screenWidthMethod),NativeBridge::screenHeight(NativeBridge::screenHeightMethod));
+            NativeBridge::ScreenWidthValue(),NativeBridge::ScreenHeightValue());
     }];
 }
 }

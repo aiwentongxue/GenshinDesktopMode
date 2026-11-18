@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include "control_hotswap_state.h"
 #include "controller_identity.h"
 
@@ -21,8 +22,11 @@ static DesktopPointerIntent pointerIntent;
 static id eventMonitor;
 static bool installed,scheduled,focused;
 static bool disconnectFallbackPending;
-static double nextPoll,mainCheckTime=-100;
-static bool mainReady;
+static double nextPoll;
+// Written by the engine input thread on focus changes and read on the main
+// queue during the gameplay probe; keep both fields atomic.
+static std::atomic<double> mainCheckTime{-100};
+static std::atomic<bool> mainReady{false};
 static const char *reason="none";
 static uint64_t committed;
 static void (*chatEvent)(id);
@@ -47,6 +51,14 @@ static void Seed(void) {
     for(GDMControllerActivity *device in tracked) {device->intent.reset();device->intent.sample(Read(device));device->chatPressed=DesktopControllerIdentity::ChatButton(device.controller,device->playStation).pressed;}
 }
 static bool InLevelPageVisible(void) {
+    // Unity scene queries allocate and touch the managed heap. The engine
+    // input update that calls ObserveFrame is not the AppKit/Unity main
+    // thread, so those queries must never run there.
+    if(!NSThread.isMainThread) {
+        static bool reported=false;
+        if(!reported){reported=true;Log(@"scene_probe refused_off_main_thread=1");}
+        return false;
+    }
     void *go=findClass("UnityEngine.CoreModule.dll","UnityEngine","GameObject");
     void *find=go?lookup(go,"Find",1,0):nullptr;
     void *name=EngineFunction<void *(*)(const char *)>(0x10e9bb794)("InLevelMainPage");
@@ -71,7 +83,41 @@ static bool InLevelPageVisible(void) {
     }
     return false;
 }
+// The startup gate used to run GameObject.Find and six scene-wide
+// FindObjectsOfType scans on the engine input thread, which crashed inside
+// IL2CPP and hitched the frame. Probe on the main queue instead, at a lower
+// rate, and keep the same page set the native mode switch relies on.
+static std::atomic<bool> gameplayProbeInFlight{false};
+static std::atomic<double> gameplayProbeEarliest{0};
+static void GameplayProbeOnMain(void) {
+    gameplayProbeInFlight.store(false);
+    if(!DesktopControlPreference::bootstrapReady.load() ||
+       DesktopControlPreference::gameplayReady.load() ||
+       NativeBridge::nativeOverlayActive || !NativeBridge::IsForeground()) return;
+    mainCheckTime=CACurrentMediaTime();
+    mainReady=InLevelPageVisible();
+    if(!mainReady)return;
+    DesktopControlPreference::gameplayReady=true;
+    dispatch_async(dispatch_get_main_queue(),^{
+        char *owner=VerifiedInputOwner();
+        if(owner)DesktopUIGeometry::After(*(int *)(owner+GenshinOffsets().ownerInputMode));
+    });
+    Log(@"desktop_controller_startup gameplay_ready=1 login_completed=1 saved_mode=%d",
+        DesktopControlPreference::SavedMode());
+}
+static void QueueGameplayProbe(void) {
+    double now=CACurrentMediaTime();
+    if(now<gameplayProbeEarliest.load(std::memory_order_relaxed))return;
+    gameplayProbeEarliest.store(now+0.5,std::memory_order_relaxed);
+    if(gameplayProbeInFlight.exchange(true))return;
+    dispatch_async(dispatch_get_main_queue(),^{GameplayProbeOnMain();});
+}
 static bool NativeReady(int mode,double now) {
+    // Mode switches rebuild managed input pages and must stay on the main
+    // queue even if a future caller forgets to hop there first.
+    if(!NSThread.isMainThread) {
+        Log(@"control_hot_swap refused_off_main_thread=1 mode=%d",mode);return false;
+    }
     DesktopHotSwapContext context;
     context.initialized=DesktopControlPreference::bootstrapReady.load()&&DesktopUI::beforeInputSwitch&&
         DesktopUI::afterInputSwitch&&NativeBridge::frames.load();
@@ -167,13 +213,8 @@ static void ObserveFrame(bool active) {
         focused=active;if(!active)pending.cancel();pointerIntent.reset();Seed();
         mainCheckTime=-100;mainReady=false;
     }
-    if(active&&DesktopControlPreference::bootstrapReady.load()&&!DesktopControlPreference::gameplayReady.load()) {
-        double now=CACurrentMediaTime();
-        if(now-mainCheckTime>=.2){mainCheckTime=now;mainReady=InLevelPageVisible();
-            if(mainReady){DesktopControlPreference::gameplayReady=true;
-                dispatch_async(dispatch_get_main_queue(),^{char *owner=VerifiedInputOwner();if(owner)DesktopUIGeometry::After(*(int *)(owner+GenshinOffsets().ownerInputMode));});
-                Log(@"desktop_controller_startup gameplay_ready=1 login_completed=1 saved_mode=%d",DesktopControlPreference::SavedMode());}}
-    }
+    if(active&&DesktopControlPreference::bootstrapReady.load()&&!DesktopControlPreference::gameplayReady.load())
+        QueueGameplayProbe();
     if(active&&disconnectFallbackPending)
         if(Request(2,"controller_disconnected",false,true))disconnectFallbackPending=false;
     if(!active || (!tracked.count&&!pending.pending))return;

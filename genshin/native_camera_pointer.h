@@ -151,8 +151,8 @@ static void Update(void *object,void *method) {
     bool held=(NativeBridge::physicalMouseSnapshot.load()&1)!=0;
     bool foreground=!pointerCaptureSuspended&&NativeBridge::IsForeground();
     float x=*(float *)(nativeInputManager+0xd0),y=*(float *)(nativeInputManager+0xd4);
-    int w=NativeBridge::screenWidth(NativeBridge::screenWidthMethod);
-    int h=NativeBridge::screenHeight(NativeBridge::screenHeightMethod);
+    int w=NativeBridge::ScreenWidthValue();
+    int h=NativeBridge::ScreenHeightValue();
     CGRect bounds{};
     bool inside=x>=0&&y>=0&&x<w&&y<h&&GameContentBounds(bounds);
     bool available=active&&foreground&&WantsVisibleCursor()&&inside;

@@ -60,8 +60,8 @@ static bool PositionInDial(void *mono,Vector2 &position) {
     {
         std::lock_guard<std::mutex> guard(NativeBridge::mutex);
         if(!NativeBridge::hasPointerPosition) return false;
-        screen={NativeBridge::normalizedX*NativeBridge::screenWidth(NativeBridge::screenWidthMethod),
-            NativeBridge::normalizedY*NativeBridge::screenHeight(NativeBridge::screenHeightMethod)};
+        screen={NativeBridge::normalizedX*NativeBridge::ScreenWidthValue(),
+            NativeBridge::normalizedY*NativeBridge::ScreenHeightValue()};
     }
     void *args[]={parent,&screen,camera,&local};
     void *result=Call(screenToLocal,nullptr,args);

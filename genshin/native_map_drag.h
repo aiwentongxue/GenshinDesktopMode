@@ -30,8 +30,8 @@ static const Snapshot &Capture(void) {
     // These are the exact absolute pixel coordinates Unity Mouse reads this
     // frame, after native input update; no second acceleration or sensitivity.
     float x=*(float *)(nativeInputManager+0xd0),y=*(float *)(nativeInputManager+0xd4);
-    int w=NativeBridge::screenWidth?NativeBridge::screenWidth(NativeBridge::screenWidthMethod):0;
-    int h=NativeBridge::screenHeight?NativeBridge::screenHeight(NativeBridge::screenHeightMethod):0;
+    int w=NativeBridge::ScreenWidthValue();
+    int h=NativeBridge::ScreenHeightValue();
     bool inside=w>0 && h>0 && x>=0 && y>=0 && x<w && y<h;
     // A game may pause its updates while inactive. Deliver cancellation even
     // if no EasyTouch frame ran between losing focus and returning to the app.
