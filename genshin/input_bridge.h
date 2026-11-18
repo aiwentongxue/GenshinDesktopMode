@@ -54,7 +54,21 @@ static uint32_t (*scrollZoomReader)(void);
 // Read only the live interaction list, on pending world-wheel input. The
 // callback is outside the input mutex and never selects or activates a row.
 static bool (*interactionWheelContext)(void);
-static bool interactionWheelDiscrete=false;
+static std::atomic<bool> interactionWheelDiscrete{false};
+static std::atomic<bool> interactionWheelFresh{false};
+static void CheckInteractionWheelOnMain(void) {
+    if(!NSThread.isMainThread || !interactionWheelContext) return;
+    interactionWheelDiscrete.store(interactionWheelContext(),std::memory_order_relaxed);
+    interactionWheelFresh.store(true,std::memory_order_relaxed);
+}
+static void RequestInteractionWheelCheck(void) {
+    static std::atomic<bool> queued{false};
+    if(queued.exchange(true)) return;
+    dispatch_async(dispatch_get_main_queue(),^{
+        queued.store(false);
+        CheckInteractionWheelOnMain();
+    });
+}
 static float normalizedX,normalizedY;
 static bool hasPointerPosition;
 static bool IsKeyHeld(int key) {
@@ -63,6 +77,21 @@ static bool IsKeyHeld(int key) {
 }
 static int (*screenWidth)(void *),(*screenHeight)(void *);
 static void *screenWidthMethod,*screenHeightMethod;
+// Unity's Screen getters are managed calls. Read them on the main thread and
+// hand the engine input thread plain cached scalars instead of invoking
+// IL2CPP twice per frame from a worker.
+static std::atomic<int> cachedScreenWidth{0},cachedScreenHeight{0};
+static int ScreenWidthValue(void) {return cachedScreenWidth.load(std::memory_order_relaxed);}
+static int ScreenHeightValue(void) {return cachedScreenHeight.load(std::memory_order_relaxed);}
+static void RefreshScreenMetrics(void) {
+    if(!NSThread.isMainThread || !screenWidth || !screenHeight ||
+       !screenWidthMethod || !screenHeightMethod) return;
+    int width=screenWidth(screenWidthMethod),height=screenHeight(screenHeightMethod);
+    if(width>0 && height>0) {
+        cachedScreenWidth.store(width,std::memory_order_relaxed);
+        cachedScreenHeight.store(height,std::memory_order_relaxed);
+    }
+}
 static std::atomic<uint64_t> frames{0}, forwardedKeys{0}, forwardedMouseFrames{0};
 static std::atomic<uint64_t> gameActionFrames{0};
 static std::atomic<uint64_t> repairedKeyStates{0};
@@ -160,8 +189,15 @@ static void Update(char *manager) {
     if(wheelContext==1 && interactionWheelContext) {
         bool pending=false;
         {std::lock_guard<std::mutex> guard(mutex);pending=scroll.hasPendingInput();}
-        if(pending) {interactionWheelDiscrete=interactionWheelContext();interactionChecked=true;}
-    } else interactionWheelDiscrete=false;
+        if(pending) {
+            // Interaction panels are Unity objects and may only be inspected
+            // on the main thread. Use the snapshot taken at event time; a
+            // path that bypassed the event monitor defers one frame while
+            // the main queue refreshes it.
+            if(interactionWheelFresh.exchange(false)) interactionChecked=true;
+            else RequestInteractionWheelCheck();
+        }
+    } else {interactionWheelDiscrete.store(false);interactionWheelFresh.store(false);}
     auto physical=KeyboardSnapshot(foreground);
     NSUInteger rawMouse=((NSUInteger (*)(id,SEL))objc_msgSend)(NSClassFromString(@"NSEvent"),sel_registerName("pressedMouseButtons"));
     physicalMouseSnapshot=(uint32_t)rawMouse;
@@ -258,12 +294,12 @@ static void Update(char *manager) {
             previousLeft=buttons[0];
         }
     }
-    if (mouseOwned && foreground && positioned && screenWidth && screenHeight) {
+    if (mouseOwned && foreground && positioned && ScreenWidthValue()>0 && ScreenHeightValue()>0) {
         // One position drives both the visible cursor and Unity hit testing.
         // Camera motion uses the axis accumulators, never an unbounded second
         // absolute cursor that could reappear at a different location.
-        *(float *)(manager+0xd0)=px*screenWidth(screenWidthMethod);
-        *(float *)(manager+0xd4)=py*screenHeight(screenHeightMethod);
+        *(float *)(manager+0xd0)=px*ScreenWidthValue();
+        *(float *)(manager+0xd4)=py*ScreenHeightValue();
     }
     ++frames;
     if(observeControlFrame) observeControlFrame(foreground);

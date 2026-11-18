@@ -28,6 +28,7 @@ static void Log(NSString *format, ...) {
 }
 
 #include "control_device_preference.h"
+#include "presentation_policy.h"
 #include "runtime_probe.h"
 #include "input_bridge.h"
 #include "pointer_bridge.h"
@@ -79,14 +80,28 @@ static void ConfigureGamePresentation(void) {
     if (![view.layer isKindOfClass:CAMetalLayer.class]) return;
 
     CAMetalLayer *layer = (CAMetalLayer *)view.layer;
-    if (layer == configuredLayer || layer.maximumDrawableCount != 3) return;
+    if (layer == configuredLayer) return;
+    configuredLayer = layer;
+    NSUInteger current = layer.maximumDrawableCount;
 
-    // A shorter drawable queue reduces the time a rendered response waits for display.
-    layer.maximumDrawableCount = 2;
-    if (layer.maximumDrawableCount == 2) {
-        configuredLayer = layer;
-        Log(@"game_presentation buffers=2 source=unity_view");
+    if (!ReducedDrawableQueueRequested()) {
+        // Leave the game and system default (typically three) untouched.
+        Log(@"game_presentation buffers=%lu opt_in_reduced=0 unchanged=1",
+            (unsigned long)current);
+        return;
     }
+    if (current != 3) {
+        Log(@"game_presentation buffers=%lu requested=2 skipped=1 reason=not_default",
+            (unsigned long)current);
+        return;
+    }
+
+    // A shorter drawable queue reduces the time a rendered response waits for
+    // display. Documented tradeoff: it can lock the frame rate to half the
+    // refresh rate when a frame does not fit one interval.
+    layer.maximumDrawableCount = 2;
+    if (layer.maximumDrawableCount == 2)
+        Log(@"game_presentation buffers=2 source=unity_view opt_in=1");
 }
 
 static void ScanInputNames(void) {
@@ -287,6 +302,7 @@ __attribute__((constructor)) static void InitializeProbe(void) {
             for (GCMouse *mouse in GCMouse.mice) AttachMouse(mouse);
             Log(@"main_queue_alive windows=%lu", (unsigned long)UIApplication.sharedApplication.windows.count);
             [NSTimer scheduledTimerWithTimeInterval:5 repeats:YES block:^(NSTimer *) {
+                NativeBridge::RefreshScreenMetrics();
                 ConfigureGamePresentation();
                 Log(@"heartbeat keyboard=%u mouse=%u frames=%llu forwarded_keys=%llu forwarded_mouse_frames=%llu action_frames=%llu repairs=%llu hardware_differences=%llu windows=%lu", keyboardEvents, mouseEvents,
                     NativeBridge::frames.load(),NativeBridge::forwardedKeys.load(),NativeBridge::forwardedMouseFrames.load(),

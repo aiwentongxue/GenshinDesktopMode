@@ -122,9 +122,9 @@ static bool GameContentBounds(CGRect &bounds,bool fitToGame=true) {
     if(!screens.count || rect.size.width<100 || rect.size.height<100) return false;
     CGRect primary=((CGRect (*)(id,SEL))objc_msgSend)(screens.firstObject,sel_registerName("frame"));
     bounds=CGRectMake(rect.origin.x,CGRectGetMaxY(primary)-CGRectGetMaxY(rect),rect.size.width,rect.size.height);
-    if(fitToGame && NativeBridge::screenWidth && NativeBridge::screenHeight) {
-        int width=NativeBridge::screenWidth(NativeBridge::screenWidthMethod);
-        int height=NativeBridge::screenHeight(NativeBridge::screenHeightMethod);
+    if(fitToGame && NativeBridge::ScreenWidthValue()>0 && NativeBridge::ScreenHeightValue()>0) {
+        int width=NativeBridge::ScreenWidthValue();
+        int height=NativeBridge::ScreenHeightValue();
         auto fit=DesktopGeometry::FitViewport({bounds.origin.x,bounds.origin.y,bounds.size.width,bounds.size.height},width,height);
         bounds=CGRectMake(fit.x,fit.y,fit.width,fit.height);
         static CGRect previous=CGRectNull;
@@ -539,6 +539,10 @@ static void ProcessDesktopScroll(id event,const DesktopScrollDispatchScope::Key 
         NativeBridge::paimonPageVisible=!NativeBridge::settingsPageVisible.load()&&
             NativeBridge::paimonScrollContext&&NativeBridge::paimonScrollContext();
     }
+    // Snapshot the interaction panel while the scroll event is still on the
+    // main thread, so the engine input update never reflects managed objects.
+    if(target==1 && NativeBridge::interactionWheelContext)
+        NativeBridge::CheckInteractionWheelOnMain();
     static auto cgInteger=(int64_t (*)(CFTypeRef,uint32_t))dlsym(RTLD_DEFAULT,"CGEventGetIntegerValueField");
     // Read the original line fields. Do not rewrite or repost the event.
     double linesX=cg&&cgInteger?(double)cgInteger(cg,12):0;
@@ -1080,6 +1084,7 @@ static void InstallPointerPosition(void) {
     if(!NativeBridge::screenWidth || !NativeBridge::screenHeight) {
         Log(@"pointer_position refused_screen_method_abi");return;
     }
+    NativeBridge::RefreshScreenMetrics();
     InstallUnityTouchCoordinates();
     static DesktopPointerObserver *observer;
     observer=[DesktopPointerObserver new];
@@ -1091,6 +1096,6 @@ static void InstallPointerPosition(void) {
         [view addGestureRecognizer:hover];
         UIPointerInteraction *pointer=[[UIPointerInteraction alloc] initWithDelegate:observer];
         [view addInteraction:pointer];[desktopPointerInteractions addObject:pointer];
-        Log(@"pointer_position installed width=%d height=%d",NativeBridge::screenWidth(NativeBridge::screenWidthMethod),NativeBridge::screenHeight(NativeBridge::screenHeightMethod));
+        Log(@"pointer_position installed width=%d height=%d",NativeBridge::ScreenWidthValue(),NativeBridge::ScreenHeightValue());
     }
 }

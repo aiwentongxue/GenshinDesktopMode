@@ -62,8 +62,8 @@ static void MouseFrame(void *scene) {
     }
     float x=nativeInputManager?*(float *)(nativeInputManager+0xd0):0;
     float y=nativeInputManager?*(float *)(nativeInputManager+0xd4):0;
-    int w=NativeBridge::screenWidth?NativeBridge::screenWidth(NativeBridge::screenWidthMethod):0;
-    int h=NativeBridge::screenHeight?NativeBridge::screenHeight(NativeBridge::screenHeightMethod):0;
+    int w=NativeBridge::ScreenWidthValue();
+    int h=NativeBridge::ScreenHeightValue();
     CGRect bounds{};
     bool inside=w>0&&h>0&&x>=0&&y>=0&&x<w&&y<h&&GameContentBounds(bounds);
     bool fresh=held&&!gesture.motion.held;

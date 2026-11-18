@@ -112,8 +112,8 @@ static void Frame(void *scene){
     }
     bool active=NativeBridge::nativeDesktopMouseUI.load()&&!NativeBridge::nativeOverlayActive&&
         !NativeBridge::controllerInputActive.load()&&NativeBridge::IsForeground()&&!pointerCaptureSuspended&&WantsVisibleCursor();
-    int w=NativeBridge::screenWidth?NativeBridge::screenWidth(NativeBridge::screenWidthMethod):0;
-    int h=NativeBridge::screenHeight?NativeBridge::screenHeight(NativeBridge::screenHeightMethod):0;
+    int w=NativeBridge::ScreenWidthValue();
+    int h=NativeBridge::ScreenHeightValue();
     V2 p{nativeInputManager?*(float *)(nativeInputManager+0xd0):NAN,nativeInputManager?*(float *)(nativeInputManager+0xd4):NAN};
     CGRect bounds{};
     bool inside=w>0&&h>0&&p.x>=0&&p.y>=0&&p.x<w&&p.y<h&&GameContentBounds(bounds);
