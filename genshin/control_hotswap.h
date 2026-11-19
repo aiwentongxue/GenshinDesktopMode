@@ -49,11 +49,17 @@ static void Seed(void) {
     for(GDMControllerActivity *device in tracked) {device->intent.reset();device->intent.sample(Read(device));device->chatPressed=DesktopControllerIdentity::ChatButton(device.controller,device->playStation).pressed;}
 }
 static bool InLevelPageVisible(bool includeMenus) {
+    // Scene lookups traverse Unity's managed heap and must stay on the main
+    // run loop, even if this helper gains another caller.
+    if(!NSThread.isMainThread||!findClass||!lookup||!invoke)return false;
     void *go=findClass("UnityEngine.CoreModule.dll","UnityEngine","GameObject");
     void *find=go?lookup(go,"Find",1,0):nullptr;
-    void *name=EngineFunction<void *(*)(const char *)>(0x10e9bb794)("InLevelMainPage");
+    auto createString=EngineFunction<void *(*)(const char *)>(0x10e9bb794);
+    if(!find||!createString)return false;
+    void *name=createString("InLevelMainPage");
+    if(!name)return false;
     void *args[]={name};
-    if(find&&Call(find,nullptr,args))return true;
+    if(Call(find,nullptr,args))return true;
     if(!includeMenus)return false;
     // These verified page types also own in-level input while the main HUD is
     // hidden. Searches are bounded and run only during a pending mode change.
