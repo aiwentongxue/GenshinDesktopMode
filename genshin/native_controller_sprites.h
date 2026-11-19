@@ -2,9 +2,8 @@
 #include "controller_glyph_profiles.h"
 #include "controller_sprite_policy.h"
 
-// Reuse the game's own atlas loader; only exact controller glyph keys in its
-// input-icon category are substituted. Button bindings and HUD geometry stay
-// owned by the original game. No external artwork or texture modification.
+// Substitute exact glyph keys at the atlas loader. The game's controller
+// family also selects button bindings, so leave its family setter alone.
 namespace NativeControllerSprites {
 using namespace SceneUIProbe;
 using DesktopControllerUI::Skin;
@@ -13,6 +12,8 @@ static Loader originalLoad;
 static void *loaderClass,*loaderInfo,*gameClass;
 static size_t loaderOffset;
 static bool installed;
+static uint64_t appliedRevision;
+static std::atomic<bool> refreshQueued{false};
 static std::atomic<unsigned> missing{0};
 static bool ASCII(void *value,char *out,size_t capacity) {
     if(!value)return false;
@@ -39,9 +40,12 @@ static void *Load(void *loader,void *key,void *category,void *method) {
     }
     return originalLoad(loader,key,category,method);
 }
-static bool TryInstall(void *game) {
+static bool TryInstall() {
     if(installed)return true;
-    if(!game||!IsModernRuntime())return false;
+    if(!IsModernRuntime()||!NativeBridge::frames.load()||!DesktopControlPreference::bootstrapReady.load())return false;
+    char *owner=VerifiedInputOwner();
+    void *game=owner?*(void **)(owner+GenshinOffsets().ownerGameInput):nullptr;
+    if(!game||strcmp(className(*(void **)game),GameInputClassName()))return false;
     loaderOffset=IsGlobalModernRuntime()?96:72;
     void *cls=ManagedFieldClassAt(*(void **)game,loaderOffset,"AEHEPABFEBB");
     if(!cls)return false;
@@ -109,5 +113,30 @@ static bool RefreshImages(void *game) {
     }
     Log(@"controller_sprite refreshed=%u images=%llu skin=%u identity_change_only=1",replaced,count,(unsigned)skin);
     return true;
+}
+
+static void QueueRefresh() {
+    if(refreshQueued.exchange(true))return;
+    dispatch_async(dispatch_get_main_queue(),^{
+        refreshQueued=false;
+        if(!installed||!DesktopControlPreference::gameplayReady.load()||!NativeBridge::IsForeground())return;
+        uint64_t revision=DesktopControllerIdentity::revision.load();
+        if(appliedRevision==revision)return;
+        char *owner=VerifiedInputOwner();
+        void *game=owner?*(void **)(owner+GenshinOffsets().ownerGameInput):nullptr;
+        if(RefreshImages(game))appliedRevision=revision;
+    });
+}
+
+static void Install() {
+    if(!IsModernRuntime())return;
+    DesktopControllerIdentity::changed=QueueRefresh;
+    DesktopControllerIdentity::InstallTransportMonitor();
+    [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *){QueueRefresh();}];
+    if(TryInstall())return;
+    __block unsigned attempts=0;
+    [NSTimer scheduledTimerWithTimeInterval:.5 repeats:YES block:^(NSTimer *timer){
+        if(TryInstall()||++attempts>=120)[timer invalidate];
+    }];
 }
 }
