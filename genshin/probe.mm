@@ -55,7 +55,7 @@ static void Log(NSString *format, ...) {
 #include "control_hotswap.h"
 #include "native_chat_focus.h"
 #include "interaction_wheel.h"
-#include "native_controller_glyphs.h"
+#include "native_controller_sprites.h"
 #include "native_clock_pointer.h"
 #include "native_team_pointer.h"
 
@@ -286,7 +286,7 @@ __attribute__((constructor)) static void InitializeProbe(void) {
                    usingBlock:^(NSNotification *) { NativeBridge::Deactivate();desktopEscapeGuard.reset(); }];
         [nc addObserverForName:@"NSApplicationWillResignActiveNotification" object:nil queue:NSOperationQueue.mainQueue
                    usingBlock:^(NSNotification *) { NativeBridge::Deactivate();desktopEscapeGuard.reset(); }];
-        dispatch_async(dispatch_get_main_queue(), ^{InstallSystemMouseMotion();InstallDeferredDesktopDevices();InstallNativeProductBackend([](bool value){if(value)PSAudio::RefreshOutputState();else ControllerHaptics::Stop();});ControllerHaptics::Install();NativeControllerGlyphs::Install();NativeChatFocus::Install();InteractionWheel::Install();DesktopControlHotSwap::Install();});
+        dispatch_async(dispatch_get_main_queue(), ^{InstallSystemMouseMotion();InstallDeferredDesktopDevices();InstallNativeProductBackend([](bool value){if(value)PSAudio::RefreshOutputState();else ControllerHaptics::Stop();});ControllerHaptics::Install();NativeControllerSprites::Install();NativeChatFocus::Install();InteractionWheel::Install();DesktopControlHotSwap::Install();});
         [nc addObserverForName:GCKeyboardDidDisconnectNotification object:nil queue:NSOperationQueue.mainQueue
                    usingBlock:^(NSNotification *) { NativeBridge::ReleaseKeys();Log(@"keyboard_disconnected released_all=1"); }];
         [nc addObserverForName:GCMouseDidDisconnectNotification object:nil queue:NSOperationQueue.mainQueue

@@ -21,10 +21,4 @@ inline Skin Resolve(Model model,Transport transport) {
     if(model==Model::DualSense||model==Model::DualShock||model==Model::PlayStation)return Skin::PSColored;
     return Skin::Native;
 }
-inline int NativeFamily(int requested,Skin skin) {
-    if(requested<1||requested>4)return requested;
-    if(skin==Skin::Xbox)return 1;
-    if(skin==Skin::PSColored||skin==Skin::PSWhite)return 2;
-    return requested;
-}
 }
