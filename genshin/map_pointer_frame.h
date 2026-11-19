@@ -4,8 +4,7 @@
 #include <cstdint>
 #include <mutex>
 
-// The UI thread publishes geometry; the engine input thread samples Quartz.
-// No AppKit/UIKit object crosses the thread boundary.
+// AppKit publishes absolute drag events. The map and cursor share this viewport.
 class DesktopMapPointerFrame {
 public:
     struct Snapshot {
@@ -21,6 +20,8 @@ public:
 private:
     mutable std::mutex lock;
     Snapshot value;
+    double frameX=0,frameY=0;
+    uint64_t pointSerial=0;
     std::atomic<bool> available{false};
 public:
     bool ready() const {return available.load(std::memory_order_acquire);}
@@ -40,5 +41,15 @@ public:
     bool current(const Snapshot &s,uint64_t focus) const {
         std::lock_guard<std::mutex> guard(lock);
         return s.active&&value.active&&s.serial==value.serial&&s.focus==focus;
+    }
+    bool record(const Snapshot &s,uint64_t focus,double screenX,double screenY) {
+        std::lock_guard<std::mutex> guard(lock);
+        if(!s.active||!value.active||s.serial!=value.serial||s.focus!=focus)return false;
+        pointSerial=s.serial;frameX=screenX;frameY=screenY;return true;
+    }
+    bool drawPoint(double &screenX,double &screenY) const {
+        std::lock_guard<std::mutex> guard(lock);
+        if(!value.active||pointSerial!=value.serial)return false;
+        screenX=frameX;screenY=frameY;return true;
     }
 };

@@ -23,11 +23,15 @@ static bool tabCursorRequested;
 static UIImage *gamePointerImage;
 static CGPoint gamePointerHotspot;
 static UIImageView *gamePointerOverlay;
+static std::atomic<bool> mapRendersCursor{false};
+static std::atomic<int> gameCursorTextureID{0};
+static std::atomic<float> cursorWidthUV{0},cursorHeightUV{0},cursorHotXUV{0},cursorHotYUV{0};
 static __weak UIWindow *wishPointerWindow;
 static UIImageView *wishPointerOverlay;
 static UIView *FindUnityView(UIView *view);
 static void ApplyGameCursorShape(const CGRect *eventBounds=nullptr);
 static void RefreshPointerStateNow(void);
+#include "native_account_input.h"
 static void UpdateNativeOverlayState(void);
 static bool WantsVisibleCursor(void);
 static bool nativePointerCaptured;
@@ -47,6 +51,7 @@ static void (*originalCursorSet)(id,SEL);
 static void (*originalWindowSendEvent)(id,SEL,id);
 static void (*originalApplicationSendEvent)(id,SEL,id);
 static bool desktopNativePressInContent;
+static DesktopMouseEventSequence desktopButtonSequence;
 static DesktopMouseEventSequence desktopDragSequence;
 static DesktopMouseEventSequence desktopMotionSequence;
 static DesktopScrollEventSequence desktopScrollSequence;
@@ -54,7 +59,6 @@ static DesktopTouchHistory desktopTouchHistory;
 static DesktopTouchStreamOwnership desktopMapTouchStreams;
 static DesktopEscapeGuard desktopEscapeGuard;
 static bool desktopNoticeEscapeOwned;
-static NSMutableSet<UITouch *> *desktopForwardedTouches;
 static auto associatePointer=(int (*)(uint32_t))dlsym(RTLD_DEFAULT,"CGAssociateMouseAndMouseCursorPosition");
 static auto warpPointer=(int (*)(CGPoint))dlsym(RTLD_DEFAULT,"CGWarpMouseCursorPosition");
 static bool ControllerOwnsGamePointer(void) {
@@ -157,7 +161,7 @@ static CGPoint DesktopMouseLocation(void) {
 }
 static int WarpDesktopPointer(CGPoint point) {
     if(!warpPointer) return -1;
-    // Batched map packets leave absolute sampling to the game frame. If a
+    // Batched map packets do not update the relative-motion history. If a
     // menu closes before that frame, seed the real pre-warp location now so
     // the first camera delta cannot include a stale map position.
     if(desktopMapMotionBatched) {
@@ -244,31 +248,29 @@ static void ReleaseFreePointerTracking(void) {
 }
 static DesktopMapPointerFrame desktopMapFrame;
 static __weak id desktopMapFrameWindow;
-static bool ReadQuartzMapPointer(CGPoint &point) {
-    // Query the current physical cursor. No event is posted or replayed, and
-    // global Quartz coordinates already use the same top-left origin.
-    static auto create=(CFTypeRef (*)(CFTypeRef))dlsym(RTLD_DEFAULT,"CGEventCreate");
-    static auto location=(CGPoint (*)(CFTypeRef))dlsym(RTLD_DEFAULT,"CGEventGetLocation");
-    if(!create||!location)return false;
-    CFTypeRef event=create(nullptr);if(!event)return false;
-    point=location(event);CFRelease(event);
-    return std::isfinite(point.x)&&std::isfinite(point.y);
+// All three mouse edges use the location AppKit captured for that event.
+static CGPoint GameMouseEventPoint(id window,id event) {
+    CGPoint local=((CGPoint (*)(id,SEL))objc_msgSend)(event,sel_registerName("locationInWindow"));
+    CGPoint screen=((CGPoint (*)(id,SEL,CGPoint))objc_msgSend)(window,sel_registerName("convertPointToScreen:"),local);
+    NSArray *screens=((id (*)(id,SEL))objc_msgSend)(NSClassFromString(@"NSScreen"),sel_registerName("screens"));
+    CGRect primary=((CGRect (*)(id,SEL))objc_msgSend)(screens.firstObject,sel_registerName("frame"));
+    return CGPointMake(screen.x,CGRectGetMaxY(primary)-screen.y);
 }
-static bool (*desktopMapPointReader)(CGPoint &)=ReadQuartzMapPointer;
 static bool DefersMapPointerPacket(void) {
     return desktopMapFrame.ready() && NativeBridge::mapDragActive &&
         !NativeBridge::nativeOverlayActive && !pointerCaptureSuspended;
 }
 static bool PrepareMapPointerFrame(id window) {
     if(desktopMapFrame.ready()&&desktopMapFrameWindow==window)return true;
-    CGRect bounds;CGPoint point;
-    if(!NSThread.isMainThread||!GameContentBounds(bounds)||!desktopMapPointReader(point))return false;
+    CGRect bounds;
+    if(!GameContentBounds(bounds))return false;
     desktopMapFrameWindow=window;
     return desktopMapFrame.publish(bounds.origin.x,bounds.origin.y,bounds.size.width,bounds.size.height,
         NativeBridge::mapFocusRevision.load());
 }
 static void SyncFreeDesktopPointer(const CGPoint *eventLocation=nullptr) {
-    if(DefersMapPointerPacket()) return;
+    if(DefersMapPointerPacket() || (!eventLocation && desktopNativePressInContent &&
+        NativeBridge::mapPageVisible.load())) return;
     if(ControllerOwnsGamePointer()) return;
     if(!gameplayPointerStarted || pointerCaptureSuspended || !WantsVisibleCursor() || !NativeBridge::IsForeground()) return;
     CGRect bounds;if(!GameContentBounds(bounds)) return;
@@ -282,8 +284,8 @@ static void SyncFreeDesktopPointer(const CGPoint *eventLocation=nullptr) {
     ApplyGameCursorShape(eventLocation?&bounds:nullptr);
 }
 static void PaintMapPointerFrame(void) {
-    // Called only on the UI thread, at most once per engine input frame.
-    // Geometry and the existing gold image remain owned by AppKit/UIKit.
+    // Coalesced on the UI run loop.
+    // Draw the last absolute drag event received by the game window.
     if(!NativeBridge::mapDragActive||NativeBridge::nativeOverlayActive||ControllerOwnsGamePointer()||
        pointerCaptureSuspended||!WantsVisibleCursor()||!NativeBridge::IsForeground()||
        !desktopMapFrameWindow||desktopMapFrameWindow!=NativeGameWindow()) {desktopMapFrame.cancel();return;}
@@ -291,30 +293,16 @@ static void PaintMapPointerFrame(void) {
     if(!GameContentBounds(bounds)){desktopMapFrame.cancel();return;}
     desktopMapFrame.publish(bounds.origin.x,bounds.origin.y,bounds.size.width,bounds.size.height,
         NativeBridge::mapFocusRevision.load());
-    capturedPointer=DesktopMouseLocation();
+    double x,y;
+    if(!desktopMapFrame.drawPoint(x,y))return;
+    capturedPointer=CGPointMake(x,y);
     if(desktopMapMotionBatched){desktopMotion.reset({capturedPointer.x,capturedPointer.y});desktopMapMotionBatched=false;}
-    ApplyGameCursorShape();
+    ApplyGameCursorShape(&bounds);
 }
 static void QueueMapPointerPaint(void) {
     static std::atomic<bool> pending{false};
     if(pending.exchange(true))return;
     dispatch_async(dispatch_get_main_queue(), ^{PaintMapPointerFrame();pending=false;});
-}
-static void SampleDesktopPointerFrame(void) {
-    // Unity's input callback is not necessarily AppKit's main thread. Sample
-    // the OS position here and defer only drawing, never the game coordinate.
-    if(!NativeBridge::mapDragActive||NativeBridge::nativeOverlayActive||NativeBridge::controllerInputActive){
-        desktopMapFrame.cancel();return;
-    }
-    auto frame=desktopMapFrame.snapshot();if(!frame.active)return;
-    CGPoint point;double x,y;
-    if(!desktopMapPointReader(point)||!frame.position(point.x,point.y,x,y)) {desktopMapFrame.cancel();return;}
-    if(!desktopMapFrame.current(frame,NativeBridge::mapFocusRevision.load()))return;
-    NativeBridge::Position(x,y);
-    QueueMapPointerPaint();
-    static std::atomic<uint64_t> samples{0};auto count=++samples;
-    if(count<=2||count%12000==0)
-        Log(@"map_pointer_frame samples=%llu source=quartz caller_main=%d ui_thread=separate",count,NSThread.isMainThread);
 }
 static void ReconcilePointerCapture(void) {
     CGRect bounds;
@@ -433,6 +421,11 @@ static void ApplyGameCursorShape(const CGRect *eventBounds) {
         Log(@"cursor_overlay installed host=%@ image=(%.0f,%.0f)",NSStringFromClass(host.class),
             gamePointerImage.size.width,gamePointerImage.size.height);
     }
+    cursorWidthUV=gamePointerImage.size.width/host.bounds.size.width;
+    cursorHeightUV=gamePointerImage.size.height/host.bounds.size.height;
+    cursorHotXUV=gamePointerHotspot.x/host.bounds.size.width;
+    cursorHotYUV=gamePointerHotspot.y/host.bounds.size.height;
+    if(mapRendersCursor.load()) {gamePointerOverlay.hidden=YES;return;}
     CGFloat x=host.bounds.origin.x+(capturedPointer.x-bounds.origin.x)/bounds.size.width*host.bounds.size.width;
     CGFloat y=host.bounds.origin.y+(capturedPointer.y-bounds.origin.y)/bounds.size.height*host.bounds.size.height;
     CGRect frame=CGRectMake(x-gamePointerHotspot.x,y-gamePointerHotspot.y,
@@ -568,7 +561,9 @@ static id ProcessDesktopMouseMotion(id event) {
     // The same event can cross NSApplication, NSWindow and local monitors.
     // Forward its native system delta once, including held-button movement.
     if(!desktopMotionSequence.firstDelivery(event)) return event;
-    CGPoint location=DesktopMouseLocation();
+    id window=((id (*)(id,SEL))objc_msgSend)(event,sel_registerName("window"));
+    CGPoint location=type==6 && window && !nativePointerCaptured ?
+        GameMouseEventPoint(window,event) : DesktopMouseLocation();
     double dx=((CGFloat (*)(id,SEL))objc_msgSend)(event,sel_registerName("deltaX"));
     double dy=((CGFloat (*)(id,SEL))objc_msgSend)(event,sel_registerName("deltaY"));
     auto delta=desktopMotion.consume({dx,dy},{location.x,location.y});
@@ -604,12 +599,48 @@ static id ProcessDesktopMouseMotion(id event) {
     }
     return event;
 }
+static void ObservePrimaryEvent(id window,id event,NSUInteger type) {
+    if((type!=1 && type!=2) || !desktopButtonSequence.firstDelivery(event)) return;
+    bool down=type==1;
+    if (NativeAccountInput::Refresh(down)) {
+        desktopNativePressInContent=false;
+        return;
+    }
+    bool game=window && window==NativeGameWindow() && !pointerCaptureSuspended &&
+        DesktopWebAppIsActive() && NativeBridge::IsForeground() && !NativeBridge::nativeOverlayActive;
+    bool inside=false;
+    DesktopPrimaryButton::Point point{};
+    if(game) {
+        CGRect content=NativeGameContentRect(window);
+        CGPoint local=((CGPoint (*)(id,SEL))objc_msgSend)(event,sel_registerName("locationInWindow"));
+        const auto [w,h]=NativeBridge::screenMetrics.read();
+        auto rect=DesktopGeometry::FitViewport({content.origin.x,content.origin.y,content.size.width,content.size.height},w,h);
+        if(rect.width>0 && rect.height>0) {
+            float u=(local.x-rect.x)/rect.width,v=(local.y-rect.y)/rect.height;
+            inside=u>=0 && u<1 && v>=0 && v<1;
+            point={u,v,!nativePointerCaptured && WantsVisibleCursor()};
+        }
+    }
+    NSUInteger flags=((NSUInteger (*)(id,SEL))objc_msgSend)(event,sel_registerName("modifierFlags"));
+    bool eligible=inside && !(flags&(1ULL<<20));
+    if(down) {
+        desktopMapFrame.cancel();
+        desktopNativePressInContent=eligible;
+    } else if(game && point.valid && desktopNativePressInContent) {
+        // Pin the final event before the OS moves the free cursor again.
+        desktopMapFrame.cancel();
+        CGPoint location=GameMouseEventPoint(window,event);
+        SyncFreeDesktopPointer(&location);
+    }
+    if(!down && !game && desktopNativePressInContent) NativeBridge::CancelDesktopPointer();
+    NativeBridge::PrimaryEvent(down,eligible,point);
+}
 static void DispatchDesktopWindowEvent(id window,SEL selector,id event) {
     NSUInteger type=((NSUInteger (*)(id,SEL))objc_msgSend)(event,sel_registerName("type"));
-    if(type==1) {
-        CGRect bounds;
-        desktopNativePressInContent=window==NativeGameWindow()&&GameContentBounds(bounds)&&
-            CGRectContainsPoint(bounds,DesktopMouseLocation());
+    ObservePrimaryEvent(window,event,type);
+    if (NativeBridge::accountSheetActive.load()) {
+        originalWindowSendEvent(window,selector,event);
+        return;
     }
     if(type==22) {
         auto key=DesktopScrollKey(event);DesktopScrollDispatchScope delivery(key);
@@ -626,9 +657,7 @@ static void DispatchDesktopWindowEvent(id window,SEL selector,id event) {
             return;
         }
         if(drag) event=ProcessDesktopMouseMotion(event);
-        else {
-            SyncFreeDesktopPointer();
-        }
+        else if(type!=2) SyncFreeDesktopPointer();
         if(++delivered<=3 || delivered%1200==0)
             Log(@"drag_window_dispatch delivered=%llu duplicates=%llu",delivered,duplicates);
         // Absolute position/button state already drives the native Unity UI
@@ -660,16 +689,25 @@ static bool DispatchOwnedMapMotion(id event,NSUInteger type) {
     if(!std::isfinite(dx)||!std::isfinite(dy)||!PrepareMapPointerFrame(window))return false;
     if(!desktopMotionSequence.firstDelivery(event))return true;
     NativeBridge::observeBatchedMapMotion(dx,dy);
-    // Preserve every original system-scaled axis delta. Absolute map/cursor
-    // position still comes from the OS once per input frame, with no filter.
+    auto frame=desktopMapFrame.snapshot();
+    CGPoint point=GameMouseEventPoint(window,event);
+    double u,v;
+    if(frame.position(point.x,point.y,u,v) &&
+       desktopMapFrame.record(frame,NativeBridge::mapFocusRevision.load(),point.x,point.y)) {
+        NativeBridge::Position(u,v);
+        if(!mapRendersCursor.load()) QueueMapPointerPaint();
+    }
     NativeBridge::Move(dx,-dy);desktopMapMotionBatched=true;
-    static uint64_t packets=0;
-    if(++packets<=2 || packets%12000==0)
-        Log(@"map_drag_dispatch batched=%llu absolute_source=engine_frame_quartz ui_thread=separate axis_gain=unchanged",packets);
     return true;
 }
 static void DispatchDesktopApplicationEvent(id application,SEL selector,id event) {
     NSUInteger type=((NSUInteger (*)(id,SEL))objc_msgSend)(event,sel_registerName("type"));
+    if(type==1 || type==2)
+        ObservePrimaryEvent(((id (*)(id,SEL))objc_msgSend)(event,sel_registerName("window")),event,type);
+    if ((type==10 || type==11) ? NativeAccountInput::Refresh() : NativeBridge::accountSheetActive.load()) {
+        originalApplicationSendEvent(application,selector,event);
+        return;
+    }
     if(DispatchOwnedMapMotion(event,type))return;
     // Publish ordinary motion before the device observer checks window and
     // geometry. The observer queues mode changes and does not consume input.
@@ -704,6 +742,7 @@ static void InstallSystemMouseMotion(void) {
         if(send) originalApplicationSendEvent=(void (*)(id,SEL,id))method_setImplementation(send,(IMP)DispatchDesktopApplicationEvent);
         Log(@"drag_application_bridge installed=%d",originalApplicationSendEvent!=nullptr);
     }
+    if(originalWindowSendEvent || originalApplicationSendEvent) NativeBridge::EnablePrimaryEvents();
     InstallGameKeyAlertGuard();
     NativeBridge::scrollContextReader=DesktopScrollContext;
     NativeBridge::scrollZoomReader=DesktopScrollZoomContext;
@@ -715,6 +754,7 @@ static void InstallSystemMouseMotion(void) {
     uint64_t mask=(1ULL<<5)|(1ULL<<6)|(1ULL<<7)|(1ULL<<27)|(1ULL<<10)|(1ULL<<11)|(1ULL<<22);
     id (^handler)(id)=^id(id event) {
         NSUInteger type=((NSUInteger (*)(id,SEL))objc_msgSend)(event,sel_registerName("type"));
+        if (NativeBridge::accountSheetActive.load()) return event;
         if(type==22) {
             if(!originalApplicationSendEvent && !originalWindowSendEvent) ProcessDesktopScroll(event,DesktopScrollKey(event));
             return event;
@@ -773,7 +813,7 @@ static void SetCursorTexture(void *texture,const float *hotspot,int mode,float u
     static void *previousTexture;
     CGPoint point=CGPointMake(hotspot?hotspot[0]:0,hotspot?hotspot[1]:0);
     if(!texture) {
-        previousTexture=nullptr;
+        previousTexture=nullptr;gameCursorTextureID=0;
         dispatch_async(dispatch_get_main_queue(), ^{
             gamePointerImage=nil;gamePointerOverlay.hidden=YES;RefreshPointerStateNow();
         });
@@ -801,6 +841,9 @@ static void SetCursorTexture(void *texture,const float *hotspot,int mode,float u
     uint64_t size=*(uint64_t *)((char *)array+24);
     if(!size || size>4*1024*1024) {Log(@"cursor_texture invalid_size=%llu",size);return;}
     NSData *png=[NSData dataWithBytes:(char *)array+32 length:size];
+    void *idMethod=lookup(*(void **)texture,"GetInstanceID",0,0);
+    void *identity=idMethod?invoke(idMethod,texture,nullptr,&exception):nullptr;
+    gameCursorTextureID=identity?*(int *)((char *)identity+16):0;
     previousTexture=texture;
     dispatch_async(dispatch_get_main_queue(), ^{
         UIImage *img=[UIImage imageWithData:png];
@@ -814,7 +857,6 @@ static void SetCursorTexture(void *texture,const float *hotspot,int mode,float u
 }
 static void InstallCursorBridge(void) {
     if (!IsCompatibleRuntime()) return;
-    NativeBridge::sampleDesktopPointer=SampleDesktopPointerFrame;
     InstallNativeCursorGuard();
     InstallSystemMouseMotion();
     struct Patch {uintptr_t va;const char *expected;void *replacement;};
@@ -899,6 +941,7 @@ static UIView *FindUnityView(UIView *view) {
 }
 
 static void UpdateNativeOverlayState(void) {
+    NativeAccountInput::Refresh();
     desktopWebStyleDiagnostic=[](bool gold) {Log(@"native_web_style_applied gold=%d",gold);};
     static bool styleHooks=false;
     if(!styleHooks && (styleHooks=InstallDesktopWebStyleHooks())) Log(@"native_web_style_hooks installed=1");
@@ -929,6 +972,7 @@ static void UpdateNativeOverlayState(void) {
     for(id web in webs)
         if(PrepareDesktopWebStyle(web,appearing)) Log(@"native_web_style scheduled text_selection=0 class=%@",NSStringFromClass([web class]));
     bool visible=webs.count>0,before=NativeBridge::nativeOverlayActive.exchange(visible);
+    if(visible!=before) NativeBridge::CancelDesktopPointer();
     DesktopWebWheel::Views(webs);
     if(!visible) NativeBridge::nativeNoticeEscapeActive=false;
     else if(appearing || !NativeBridge::nativeNoticeEscapeActive)
@@ -972,43 +1016,29 @@ static CGPoint SharedTouchPreviousLocation(UITouch *touch,SEL selector,UIView *v
 }
 static void DeliverUnityMouseTouch(UIView *view,SEL selector,NSSet<UITouch *> *touches,UIEvent *event,
                                   UITouchPhase phase,UnityTouchCallback original) {
-    if(NativeBridge::nativePointerGestures.load()&&NativeBridge::nativeDesktopMouseUI.load()&&
-       !NativeBridge::nativeOverlayActive&&!pointerCaptureSuspended&&NativeBridge::IsForeground()) return;
-    bool claim=phase==UITouchPhaseBegan && NativeBridge::mapTouchOwnership && NativeBridge::mapTouchOwnership(true);
+    bool began=phase==UITouchPhaseBegan;
+    bool accountTouch=began && NativeAccountInput::Refresh();
+    bool game=began && !accountTouch && !NativeBridge::nativeOverlayActive && !pointerCaptureSuspended && NativeBridge::IsForeground();
+    bool claim=game && NativeBridge::nativeDesktopMouseUI &&
+        (NativeBridge::nativePointerGestures || nativePointerCaptured);
+    if(game && !claim && NativeBridge::mapTouchOwnership) claim=NativeBridge::mapTouchOwnership(true);
     NSMutableSet<UITouch *> *remaining=nil;
     for(UITouch *touch in touches) {
-        if(desktopMapTouchStreams.suppress((__bridge const void *)touch,(int)phase,claim)) {
+        // An indirect pointer starting in gamepad mode can request a handoff.
+        // Its UIKit stream must not also start an attack in the old layout.
+        bool switchClick=game && NativeBridge::controllerInputActive && DesktopControlPreference::gameplayReady &&
+            touch.type==UITouchTypeIndirectPointer;
+        if(desktopMapTouchStreams.suppress((__bridge const void *)touch,(int)phase,accountTouch||claim||switchClick)) {
             if(!remaining) remaining=[touches mutableCopy];
             [remaining removeObject:touch];
         }
     }
     if(remaining && !remaining.count) return;
     if(remaining) touches=remaining;
-    if(NativeBridge::nativeDesktopMouseUI.load() && nativePointerCaptured &&
-       !pointerCaptureSuspended && NativeBridge::IsForeground()) {
-        if(phase==UITouchPhaseEnded || phase==UITouchPhaseCancelled) {
-            bool completing=false;
-            for(UITouch *touch in touches) if([desktopForwardedTouches containsObject:touch]) completing=true;
-            if(completing) {
-                original(view,selector,touches,event);
-                [desktopForwardedTouches minusSet:touches];return;
-            }
-        }
-        // The game's PC module consumes real Unity mouse state. Do not feed
-        // Catalyst's parallel touch stream into the game at the same time.
-        static uint64_t suppressed=0;
-        if(++suppressed<=3 || suppressed%1200==0)
-            Log(@"native_pc_touch_suppressed events=%llu phase=%ld",suppressed,(long)phase);
-        desktopTouchHistory.reset();return;
-    }
-    if(NativeBridge::nativeDesktopMouseUI.load() && !nativePointerCaptured) {
-        // Native desktop UI ignores touch input, while the map's EasyTouch
-        // gesture layer can still consume normal Catalyst pointer gestures.
-        // With an OS-owned visible cursor these are already at true positions.
-        if(!desktopForwardedTouches) desktopForwardedTouches=[NSMutableSet set];
-        if(phase==UITouchPhaseBegan) [desktopForwardedTouches unionSet:touches];
+    if(NativeBridge::nativeDesktopMouseUI.load()) {
+        // Forward the rest of a stream whose Began was delivered to Unity,
+        // including its terminal phase after a capture or ownership change.
         original(view,selector,touches,event);
-        if(phase==UITouchPhaseEnded || phase==UITouchPhaseCancelled) [desktopForwardedTouches minusSet:touches];
         return;
     }
     UITouch *touch=touches.count==1?touches.anyObject:nil;

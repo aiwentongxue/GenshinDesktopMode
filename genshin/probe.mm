@@ -104,6 +104,42 @@ static void ConfigureGamePresentation(void) {
         Log(@"game_presentation buffers=2 source=unity_view opt_in=1");
 }
 
+// Sample Unity's own counters on the main run loop.
+static void LogGameFrameRate(void) {
+    using namespace SceneUIProbe;
+    static void *targetRate,*renderedFrames,*vsync;
+    static double lastTime;
+    static int lastCount;
+    id window=NativeGameWindow();
+    if(!window || !NativeBridge::frames.load() || !NativeBridge::IsForeground()) {
+        lastTime=0;
+        return;
+    }
+    auto getter=[](const char *type,const char *name) {
+        void *cls=findClass("UnityEngine.CoreModule.dll","UnityEngine",type);
+        return cls?lookup(cls,name,0,0):nullptr;
+    };
+    if(!renderedFrames) {
+        renderedFrames=getter("Time","get_renderedFrameCount");
+        targetRate=getter("Application","get_targetFrameRate");
+        vsync=getter("QualitySettings","get_vSyncCount");
+    }
+    auto value=[](void *method) {
+        void *box=Call(method,nullptr);
+        return box?*(int *)((char *)box+16):-1;
+    };
+    id screen=((id (*)(id,SEL))objc_msgSend)(window,sel_registerName("screen"));
+    if(!screen)return;
+    auto displayHz=((NSInteger (*)(id,SEL))objc_msgSend)(screen,sel_registerName("maximumFramesPerSecond"));
+    int count=value(renderedFrames);
+    double now=CACurrentMediaTime();
+    if(lastTime && count>=lastCount && count>=0)
+        Log(@"game_frame_rate target=%d rendered_fps=%.1f display_max_hz=%ld vsync_count=%d low_power=%d",
+            value(targetRate),(count-lastCount)/(now-lastTime),(long)displayHz,value(vsync),
+            NSProcessInfo.processInfo.lowPowerModeEnabled);
+    lastCount=count;lastTime=now;
+}
+
 static void ScanInputNames(void) {
     const char *terms[] = {"MoleMole", "ReInput", "IsPCMode", "IsWindowsPlatform",
                           "StandaloneInputModule", "UnityEngine.InputSystem", "Rewired"};
@@ -262,9 +298,9 @@ __attribute__((constructor)) static void InitializeProbe(void) {
             Log(@"probe_disabled runtime_layout_mismatch va=0x%llx",(unsigned long long)runtimeLayoutMismatch);
             return;
         }
-        Log(@"input_revision=44 native_authored_motion=%d native_vibration_settings=%d keyboard_ui_geometry_restore=1",
+        Log(@"input_revision=46 native_authored_motion=%d native_vibration_settings=%d keyboard_ui_geometry_restore=1",
             GDM_EMBEDDED_MOTION_PACK, GDM_EMBEDDED_MOTION_PACK);
-        Log(@"input_features=mixed_container_conditions codex_3d_mouse modal_padding_restore friend_wheel build=r45");
+        Log(@"input_features=mixed_container_conditions codex_3d_mouse modal_padding_restore friend_wheel build=r46");
         // Authored native PCM uses no ordinary game-audio capture hooks.
 #if defined(GDM_CONTROLLER_UI_PREVIEW)
         Log(@"controller_ui_preview=1 physical_controller_emulated=0");
@@ -303,6 +339,7 @@ __attribute__((constructor)) static void InitializeProbe(void) {
             Log(@"main_queue_alive windows=%lu", (unsigned long)UIApplication.sharedApplication.windows.count);
             [NSTimer scheduledTimerWithTimeInterval:5 repeats:YES block:^(NSTimer *) {
                 ConfigureGamePresentation();
+                LogGameFrameRate();
                 Log(@"heartbeat keyboard=%u mouse=%u frames=%llu forwarded_keys=%llu forwarded_mouse_frames=%llu action_frames=%llu repairs=%llu hardware_differences=%llu windows=%lu", keyboardEvents, mouseEvents,
                     NativeBridge::frames.load(),NativeBridge::forwardedKeys.load(),NativeBridge::forwardedMouseFrames.load(),
                     NativeBridge::gameActionFrames.load(),

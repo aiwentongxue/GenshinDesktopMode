@@ -89,13 +89,14 @@ static void RepairRoot(void *root){
         Log(@"desktop_ui_padding restored_keyboard=%d role=%s observed_console=%d",ok,layer.path,console);
     }
 }
+static void (*originalAdapt)(void *,V2,V2,void *);
 static void Restore(uint64_t expected,unsigned attempt){
     if(expected!=revision||!KeyboardReady())return;
     RepairRoot(Root());
     // Keep a bounded fallback for clients whose adapter is unavailable. Only
     // one restore chain may survive a successful new device handoff.
     uint64_t ticket=restoreTicket;
-    if(attempt<10)dispatch_after(dispatch_time(DISPATCH_TIME_NOW,100*NSEC_PER_MSEC),dispatch_get_main_queue(),^{
+    if(!originalAdapt && attempt<10)dispatch_after(dispatch_time(DISPATCH_TIME_NOW,100*NSEC_PER_MSEC),dispatch_get_main_queue(),^{
         if(ticket==restoreTicket)Restore(expected,attempt+1);
     });
 }
@@ -111,7 +112,6 @@ static void AdapterFinished(void *adapter){
        !ReadTarget(Child(root,"Pages"),page))return;
     RepairRoot(root);
 }
-static void (*originalAdapt)(void *,V2,V2,void *);
 static void Adapt(void *adapter,V2 min,V2 max,void *method){
     originalAdapt(adapter,min,max,method);
     AdapterFinished(adapter);

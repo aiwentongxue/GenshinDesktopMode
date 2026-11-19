@@ -24,7 +24,7 @@ static void PrepareInputSwitch(int inputMode) {
     bool wasController=NativeBridge::controllerInputActive.load();
     // The callback needs the previous value to release native mouse state.
     if(beforeInputSwitch) beforeInputSwitch(inputMode);
-    NativeBridge::controllerInputActive=inputMode==3;
+    NativeBridge::SetControllerOwnership(inputMode==3);
     if(wasController!=(inputMode==3)) RefreshPointerLock();
 }
 static void CompleteInputSwitch(void *owner) {
@@ -33,7 +33,7 @@ static void CompleteInputSwitch(void *owner) {
     // from the native owner after the outermost switch, including refusals.
     if(layoutSwitchDepth || !owner) return;
     int actual=*(int *)((char *)owner+GenshinOffsets().ownerInputMode);
-    NativeBridge::controllerInputActive=actual==3;
+    NativeBridge::SetControllerOwnership(actual==3);
     if(afterInputSwitch) afterInputSwitch(actual);
     DesktopUIGeometry::After(actual);
     RefreshPointerLock();
@@ -141,9 +141,11 @@ static bool SwitchInputMode(int requestedMode) {
     void *method=lookup(*(void **)owner,LayoutSwitchMethodName(),2,0);
     if(!method || ManagedMethodCode(method)!=(uintptr_t)EngineFunction<void *>(0x1068c8584)) return false;
     int layout=DesktopControllerLayout::Select(requestedMode,1);void *args[]={&layout,&requestedMode},*exception=nullptr;
-    void *result=invoke(method,owner,args,&exception);
+    invoke(method,owner,args,&exception);
     if(exception) CompleteInputSwitch(owner);
-    bool accepted=!exception && result && *(bool *)((char *)result+16) &&
+    // Native returns false for an already committed selection. The input
+    // owner and the displayed layout are the authoritative postcondition.
+    bool accepted=!exception &&
         *(int *)(ui+GenshinOffsets().uiLayout)==layout &&
         *(int *)(owner+GenshinOffsets().ownerInputMode)==requestedMode;
     Log(@"desktop_ui_select_device requested=%d layout=%d actual=%d accepted=%d exception=%p",
@@ -161,7 +163,6 @@ static void RepairDeviceLayout(int mode,uint64_t revision,uint64_t completed,uns
     bool accepted=completedLayoutSwitches!=completed &&
         *(int *)(ui+GenshinOffsets().uiLayout)==expected;
     if(!accepted) accepted=SwitchInputMode(mode);
-    else CompleteInputSwitch(input);
     Log(@"desktop_ui_device_rebuild mode=%d attempt=%u accepted=%d",mode,attempt+1,accepted);
     if(!accepted && attempt<7)
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,100*NSEC_PER_MSEC),dispatch_get_main_queue(), ^{

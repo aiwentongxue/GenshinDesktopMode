@@ -43,14 +43,7 @@ static unsigned Rows(void *list) {
     return active;
 }
 static bool Context() {
-    // Unity components may only be reflected on the main thread. Callers
-    // from the engine input worker fail closed instead of touching managed
-    // objects there; the scroll event path snapshots this on the main queue.
-    if(!NSThread.isMainThread) {
-        static bool reported=false;
-        if(!reported){reported=true;Log(@"interaction_wheel refused_off_main_thread=1");}
-        return false;
-    }
+    // Inspect the selection on the UI run loop at packet receipt.
     const double now=CACurrentMediaTime();
     // Only called with physical wheel input in captured world view. Bound
     // reflection during a rapid wheel burst; a new gesture checks immediately.

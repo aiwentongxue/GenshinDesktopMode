@@ -136,6 +136,8 @@ static void Install() {
     if(TryInstall())return;
     __block unsigned attempts=0;
     [NSTimer scheduledTimerWithTimeInterval:.5 repeats:YES block:^(NSTimer *timer){
+        // Waiting at the title or account screen must not exhaust the install attempts.
+        if(!DesktopControlPreference::gameplayReady.load()||!NativeBridge::IsForeground())return;
         if(TryInstall()||++attempts>=120)[timer invalidate];
     }];
 }

@@ -97,7 +97,7 @@ static uint64_t inputHandoffRevision;
 static void ReleaseMouseOverrides(bool restoreVirtual) {
     if(!ownsMouseOverrides) return;
     ownsMouseOverrides=false;
-    NativeBridge::nativeDesktopMouseUI=false;
+    NativeBridge::SetDesktopMouseUI(false);
     NativeBridge::ReleaseKeys();
     char *owner=InputOwner();
     if(!owner || *(void **)(owner+GenshinOffsets().ownerModule)!=configuredModule ||
@@ -115,11 +115,7 @@ static void BeforeInputSwitch(int mode) {
     if(mode!=2) ReleaseMouseOverrides(true);
     if(changed) {
         ++inputHandoffRevision;
-        NativeBridge::ReleaseDesktopMouseState(mode==2);
-        NativeBridge::handoffMouseBlocked=(uint32_t)((NSUInteger (*)(id,SEL))objc_msgSend)(
-            NSClassFromString(@"NSEvent"),sel_registerName("pressedMouseButtons"));
-        ++NativeBridge::mapFocusRevision;
-        NativeBridge::mapDragActive=false;
+        NativeBridge::SetControllerOwnership(mode==3);
         // Drop ownership of old presses and motion, keeping the authoritative
         // hardware key-up source (including the accepted A-key repair).
         desktopEscapeGuard.reset();desktopNoticeEscapeOwned=false;
@@ -128,7 +124,6 @@ static void BeforeInputSwitch(int mode) {
         desktopDragSequence.reset();desktopMotionSequence.reset();desktopTouchHistory.reset();
         CGPoint point=DesktopMouseLocation();desktopMotion.reset({point.x,point.y});
     }
-    NativeBridge::controllerInputActive=mode==3;
     if(changed && mode==2) {
         // Seed a usable physical pointer before rebuilding the native views.
         // Their subsequent Cursor requests own the final menu/world state.
@@ -139,7 +134,7 @@ static void BeforeInputSwitch(int mode) {
 static void Apply(void) {
     char *owner=InputOwner();if(!owner) return;
     int mode=*(int *)(owner+GenshinOffsets().ownerInputMode);
-    NativeBridge::controllerInputActive=mode==3;
+    NativeBridge::SetControllerOwnership(mode==3);
     if(mode!=2) {
         // The native operation owns all flags after a switch. A missed hook
         // drops our ownership without restoring stale page/module values.
@@ -147,14 +142,14 @@ static void Apply(void) {
             ownsMouseOverrides=false;NativeBridge::ReleaseKeys();
             Log(@"native_pc_late_release device=%d flags_untouched=1",mode);
         }
-        NativeBridge::nativeDesktopMouseUI=false;return;
+        NativeBridge::SetDesktopMouseUI(false);return;
     }
     void *module=*(void **)(owner+GenshinOffsets().ownerModule),*hybrid=*(void **)(owner+GenshinOffsets().ownerHybrid);
     if(!module || !hybrid || strcmp(className(*(void **)module),"MihoyoStandaloneInputModule") ||
        strcmp(className(*(void **)hybrid),"MihoyoHybridInput")) return;
     if(!wantNative) {ReleaseMouseOverrides(true);return;}
     if(module!=configuredModule || hybrid!=configuredHybrid) {
-        ownsMouseOverrides=false;NativeBridge::nativeDesktopMouseUI=false;
+        ownsMouseOverrides=false;NativeBridge::SetDesktopMouseUI(false);
         configuredModule=module;configuredHybrid=hybrid;
     }
     if(!ownsMouseOverrides) {
@@ -168,7 +163,7 @@ static void Apply(void) {
         SetBool(hybrid,"set_useVirtualCursor",false);
     bool native=ok && !Bool(module,"get_allowTouchInput") && Bool(module,"get_forceModuleActive") &&
         !Bool(hybrid,"get_useVirtualCursor");
-    NativeBridge::nativeDesktopMouseUI=native;
+    NativeBridge::SetDesktopMouseUI(native);
     if(active!=native) Log(@"native_pc_enabled=%d allowTouch=%d force=%d virtual=%d mousePresent=%d",
         native,Bool(module,"get_allowTouchInput"),Bool(module,"get_forceModuleActive"),Bool(hybrid,"get_useVirtualCursor"),Bool(hybrid,"get_mousePresent"));
 }

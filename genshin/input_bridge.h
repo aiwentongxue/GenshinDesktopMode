@@ -4,6 +4,7 @@
 #include <atomic>
 #include <array>
 #include "keyboard_state.h"
+#include "primary_button.h"
 #include "hardware_state.h"
 #include "scroll_state.h"
 #include "screen_metrics.h"
@@ -14,6 +15,7 @@ static std::atomic<bool> nativeDesktopMouseUI{false};
 static std::atomic<bool> controllerInputActive{false};
 static std::atomic<bool> nativeNoticeEscapeActive{false};
 static std::atomic<bool> nativeOverlayActive{false};
+static std::atomic<bool> accountSheetActive{false};
 static std::atomic<bool> mapPageVisible{false};
 static std::atomic<bool> mapDragActive{false};
 static std::atomic<bool> nativePointerGestures{false};
@@ -32,7 +34,6 @@ static void (*stopControllerFeedback)(void);
 // Read-only device activity is sampled after the native update has returned;
 // mode rebuilding is queued outside this engine call.
 // Sample the latest OS position once before Unity consumes this frame's input.
-static void (*sampleDesktopPointer)(void);
 // Observe the original AppKit dispatch before local monitors may consume Esc.
 // The observer queues mode changes; it never consumes or modifies the event.
 static void (*observeDesktopEvent)(id event);
@@ -46,6 +47,8 @@ static std::mutex mutex;
 static KeyboardState keyboard;
 static auto &heldKeys=keyboard.held;
 static std::array<bool,7> mouseButtons;
+static DesktopPrimaryButton primaryButton;
+static bool primaryUsesEvents,mouseReleasePending;
 static float deltaX,deltaY;
 static DesktopWheelRouter scroll;
 static std::atomic<bool> systemScrollActive{false};
@@ -93,20 +96,47 @@ static void SystemKey(unsigned short macKey,bool pressed) {
 static void SuppressNoticeEscape(void) {
     std::lock_guard<std::mutex> guard(mutex);keyboard.blockUntilRelease(27);
 }
+static void CancelMouseLocked(void) {
+    primaryButton.cancel();
+    mouseButtons.fill(false);
+    mouseReleasePending=true;
+    physicalMouseSnapshot=0;
+    ++mapFocusRevision;
+    mapDragActive=false;
+}
+static void CancelDesktopPointer(void) {
+    std::lock_guard<std::mutex> guard(mutex);
+    CancelMouseLocked();
+}
+static void SetAccountSheetActive(bool active) {
+    std::lock_guard<std::mutex> guard(mutex);
+    accountSheetActive=active;
+    if (active) keyboard.focus(false);
+    CancelMouseLocked();
+    deltaX=deltaY=0;
+    scroll.cancel();
+    // A held SDK press must finish in the SDK even when it dismisses the sheet.
+    uint32_t held=(uint32_t)((NSUInteger (*)(id,SEL))objc_msgSend)(
+        NSClassFromString(@"NSEvent"),sel_registerName("pressedMouseButtons"));
+    handoffMouseBlocked.fetch_or(held);
+}
+static void SetDesktopMouseUI(bool active) {
+    if(nativeDesktopMouseUI.load()==active) return;
+    std::lock_guard<std::mutex> guard(mutex);
+    if(nativeDesktopMouseUI.exchange(active)!=active) CancelMouseLocked();
+}
 static void ReleaseKeys(void) {
     std::lock_guard<std::mutex> guard(mutex);
     keyboard.release();
-    mouseButtons.fill(false);deltaX=deltaY=0;scroll.cancel();
+    CancelMouseLocked();deltaX=deltaY=0;scroll.cancel();
 }
 static void Deactivate(void) {
     if(stopControllerFeedback) stopControllerFeedback();
-    ++mapFocusRevision;
-    mapDragActive=false;
     keyboardSources.reset();
     paimonPageVisible=false;settingsPageVisible=false;friendPageVisible=false;
     std::lock_guard<std::mutex> guard(mutex);
     keyboard.focus(false);
-    mouseButtons.fill(false);deltaX=deltaY=0;scroll.cancel();
+    CancelMouseLocked();deltaX=deltaY=0;scroll.cancel();
 }
 static void Move(float x,float y) {
     std::lock_guard<std::mutex> guard(mutex);if(keyboard.active){deltaX+=x;deltaY+=y;}
@@ -151,51 +181,66 @@ static void CenterPointer(void) {
 static void MouseButton(unsigned button,bool pressed) {
     if (button>=7) return;
     uint32_t mask=1u<<button;
-    if(!pressed) handoffMouseBlocked.fetch_and(~mask);
     std::lock_guard<std::mutex> guard(mutex);
-    mouseButtons[button]=keyboard.active && pressed && !(handoffMouseBlocked.load()&mask);
+    if(button==0 && primaryUsesEvents) return;
+    if(!pressed) handoffMouseBlocked.fetch_and(~mask);
+    mouseButtons[button]=keyboard.active && !controllerInputActive && pressed && !(handoffMouseBlocked.load()&mask);
 }
-static void ReleaseDesktopMouseState(bool returningToKeyboard=false) {
-    if(returningToKeyboard) {
-        std::lock_guard<std::mutex> guard(mutex);
-        keyboard.handoffToKeyboard();
-        mouseButtons.fill(false);deltaX=deltaY=0;scroll.cancel();
-    } else ReleaseKeys();
-    if(!nativeInputManager || !enabled) return;
-    auto setter=EngineFunction<void (*)(void *,int,bool)>(0x10eec31b8);
-    for(unsigned b=0;b<7;++b) setter(nativeInputManager,323+b,false);
-    for(unsigned offset:{0xc0u,0xc4u,0xc8u,0xccu}) *(float *)(nativeInputManager+offset)=0;
+static void EnablePrimaryEvents(void) {
+    std::lock_guard<std::mutex> guard(mutex);
+    if(!primaryUsesEvents) {CancelMouseLocked();primaryUsesEvents=true;}
+}
+static void PrimaryEvent(bool down,bool eligible,DesktopPrimaryButton::Point point) {
+    std::lock_guard<std::mutex> guard(mutex);
+    if(!down) handoffMouseBlocked.fetch_and(~1u);
+    if(!primaryUsesEvents || controllerInputActive || nativeOverlayActive || !keyboard.active) return;
+    // A real new AppKit down is authoritative even if a trackpad never
+    // exposed its previous tap in the physical button mask.
+    primaryButton.event(down,eligible,point);
+}
+static void SetControllerOwnership(bool controller) {
+    if(controllerInputActive.load()==controller) return;
+    std::lock_guard<std::mutex> guard(mutex);
+    if(controllerInputActive.load()==controller) return;
+    controllerInputActive=controller;
+    if(controller) keyboard.release(); else keyboard.handoffToKeyboard();
+    handoffMouseBlocked=(uint32_t)((NSUInteger (*)(id,SEL))objc_msgSend)(
+        NSClassFromString(@"NSEvent"),sel_registerName("pressedMouseButtons"));
+    CancelMouseLocked();deltaX=deltaY=0;scroll.cancel();
 }
 static void Update(char *manager) {
-    bool mouseOwned=!controllerInputActive.load();
-    if(sampleDesktopPointer)sampleDesktopPointer();
+    bool mouseOwned;
     auto setter=EngineFunction<void (*)(void *,int,bool)>(0x10eec31b8);
-    bool foreground=IsForeground();
+    bool foreground=IsForeground() && !accountSheetActive.load();
     uint32_t wheelContext=foreground && !nativeOverlayActive?
         (scrollContextReader?scrollContextReader():1):0;
     uint32_t zoomContext=wheelContext && scrollZoomReader?scrollZoomReader():0;
     bool interactionWheelDiscrete;
     auto physical=KeyboardSnapshot(foreground);
     NSUInteger rawMouse=((NSUInteger (*)(id,SEL))objc_msgSend)(NSClassFromString(@"NSEvent"),sel_registerName("pressedMouseButtons"));
-    physicalMouseSnapshot=(uint32_t)rawMouse;
-    uint32_t blocked=handoffMouseBlocked.fetch_and((uint32_t)rawMouse)&(uint32_t)rawMouse;
-    NSUInteger physicalMouse=foreground?(rawMouse&~(NSUInteger)blocked):0;
     std::vector<std::pair<int,bool>> events;
     std::array<bool,7> buttons;
-    float x,y,sx,sy,px,py;bool positioned,mosScroll;unsigned movement=0;
+    float x,y,sx,sy,px,py,zoomGain;bool positioned,mosScroll;unsigned movement=0;
+    uint64_t pointerRevision;
     {
         std::lock_guard<std::mutex> guard(mutex);
+        foreground=foreground && !accountSheetActive.load();
         if(keyboard.active!=foreground) {
             keyboard.focus(foreground);
-            mouseButtons.fill(false);deltaX=deltaY=0;scroll.cancel();
+            CancelMouseLocked();deltaX=deltaY=0;scroll.cancel();
             Log(@"input_focus active=%d released_all=1",foreground);
         }
         if(nativeNoticeEscapeActive && physical[27]) keyboard.blockUntilRelease(27);
         repairedKeyStates+=keyboard.reconcile(physical);
+        mouseOwned=!controllerInputActive;
+        pointerRevision=mapFocusRevision.load();
+        uint32_t blocked=handoffMouseBlocked.fetch_and((uint32_t)rawMouse);
+        NSUInteger physicalMouse=foreground?(rawMouse&~(NSUInteger)blocked):0;
         if(nativeDesktopMouseUI.load()) {
-            for(unsigned b=0;b<7;++b) mouseButtons[b]=!nativeOverlayActive && (physicalMouse&(1UL<<b))!=0;
+            for(unsigned b=primaryUsesEvents?1:0;b<7;++b)
+                mouseButtons[b]=!nativeOverlayActive && (physicalMouse&(1UL<<b))!=0;
         }
-        events.swap(keyboard.pending);buttons=mouseButtons;
+        events.swap(keyboard.pending);
         movement=(heldKeys[97]?1:0)|(heldKeys[100]?2:0)|(heldKeys[115]?4:0)|(heldKeys[119]?8:0);
         x=deltaX;y=deltaY;
         // A map/list/world transition cancels an ordinary wheel's short tail
@@ -205,6 +250,27 @@ static void Update(char *manager) {
         mosScroll=scroll.usingMos();
         sx=(float)wheel.x;sy=(float)wheel.y;
         px=normalizedX;py=normalizedY;positioned=hasPointerPosition;
+        if(primaryUsesEvents && mouseOwned && foreground && !nativeOverlayActive) {
+            auto frame=primaryButton.frame((rawMouse&1u)!=0);
+            mouseButtons[0]=frame.down;
+            if(frame.position.valid) {px=frame.position.x;py=frame.position.y;positioned=true;}
+        }
+        buttons=mouseButtons;
+        if(mouseReleasePending || !mouseOwned || !foreground || nativeOverlayActive) buttons.fill(false);
+        uint32_t mask=0;
+        for(unsigned b=0;b<buttons.size();++b) if(buttons[b]) mask|=1u<<b;
+        physicalMouseSnapshot=mask;
+        zoomGain=interactionWheelDiscrete?1.0f:DesktopWheelZoomPolicy::gain(mosScroll,zoomContext);
+        sx*=zoomGain;sy*=zoomGain;
+        if(!mouseOwned || mouseReleasePending) x=y=sx=sy=0;
+        // The input frame is the only writer. A boundary between frames
+        // guarantees a neutral native update even if the new owner is a pad.
+        if(mouseOwned || mouseReleasePending) {
+            for(unsigned b=0;b<buttons.size();++b) setter(manager,323+b,buttons[b]);
+            *(float *)(manager+0xc0)=x;*(float *)(manager+0xc4)=y;
+            *(float *)(manager+0xc8)=sx;*(float *)(manager+0xcc)=sy;
+        }
+        mouseReleasePending=false;
         deltaX=deltaY=0;
     }
     for (auto event : events) {
@@ -213,17 +279,6 @@ static void Update(char *manager) {
         if (count<=8) Log(@"keyboard_frame_forwarded pressed=%d engine_readback=%d",
             event.second,EngineFunction<bool (*)(int)>(0x10e864028)(event.first));
     }
-    if(mouseOwned) for (unsigned b=0;b<7;++b) setter(manager,323+b,buttons[b]);
-    // Feed Unity's native mouse accumulators BEFORE its axis update. This
-    // updates all configured aliases (including Rewired's MouseAxis1/2/3),
-    // preserving each axis's sensitivity and raw-value semantics.
-    if(mouseOwned) {*(float *)(manager+0xc0)=x;*(float *)(manager+0xc4)=y;}
-    // Selection uses whole rows; the world-camera zoom multiplier would turn
-    // a two-notch packet into three native selection steps.
-    float zoomGain=interactionWheelDiscrete?1.0f:DesktopWheelZoomPolicy::gain(mosScroll,zoomContext);
-    sx*=zoomGain;sy*=zoomGain;
-    if(mouseOwned) {*(float *)(manager+0xc8)=sx;*(float *)(manager+0xcc)=sy;}
-    else {x=y=sx=sy=0;buttons.fill(false);}
     originalUpdate(manager);
     if(IsModernRuntime()) {
         unsigned engine=0,held=0;unsigned mask=1;
@@ -268,7 +323,7 @@ static void Update(char *manager) {
         }
     }
     const auto pixels=screenMetrics.read();
-    if (mouseOwned && foreground && positioned && pixels.width && pixels.height) {
+    if (mouseOwned && pointerRevision==mapFocusRevision.load() && foreground && positioned && pixels.width && pixels.height) {
         // One position drives both the visible cursor and Unity hit testing.
         // Camera motion uses the axis accumulators, never an unbounded second
         // absolute cursor that could reappear at a different location.
