@@ -4,12 +4,15 @@
 
 Genshin Desktop Mode is a keyboard, mouse, and controller compatibility plugin for the iOS version of Genshin Impact running through PlayCover on Apple Silicon Macs.
 
-## R45
+## R46
 
-- 支持桌面控制界面、键鼠与手柄切换，以及按设备显示手柄按键提示。
-- 适配地图、图鉴、调时间、队伍重排和聊天输入。大世界多项 F 交互使用分格滚轮切换。
-- 当前源码含双缓冲试用改动。它为识别到的 Unity 游戏窗口减少一层绘图缓冲。实际延迟和帧率取决于显示器、场景和游戏设置。
-- 兼容性按运行时结构判断，当前入口包含已核对过的 7.2 国服和国际服。客户端更新后需要重新核对。
+- 手柄类型和按键绑定由游戏识别。Xbox Series X 和 DualSense 可使用原生布局查看、修改按键，切换角色、交互和确认、取消也使用该布局。部分 DualSense 连接会显示游戏分配的 Xbox 键名。
+- 鼠标拖动地图时，金色光标与地标同步移动。鼠标单击或触控板轻点地图空白处可以新建标记。
+- 切换账号时由账号弹窗独占鼠标点击，返回标题页后可看到云层、门、「点击进入」和两侧按钮。
+- 游戏使用系统默认的绘图缓冲设置。手柄热切换期间在主线程查询游戏界面。
+- 国服和国际服使用同一份插件，已核对两个 7.2 客户端的运行时结构。
+
+[下载 R46](https://github.com/cnSniperMike/GenshinDesktopMode/releases/tag/R46)。需要完整手柄震动时，请选择 `GenshinDesktopMode_R46.dylib`。基础版文件名带有 `_Basic`。
 
 ## 构建和使用
 
@@ -20,13 +23,15 @@ zsh build_genshin.sh
 zsh test.sh
 ```
 
-构建生成 `.build/GenshinDesktopMode_R45.dylib`，并校验签名。退出游戏后，把这个文件导入已有的 PlayCover 插件加载入口。每个客户端只加载一个版本的桌面模式插件。
+默认构建生成 `.build/GenshinDesktopMode_R46_Basic.dylib`，并校验签名。退出游戏后，把这个文件导入已有的 PlayCover 插件加载入口。每个客户端只加载一个版本的桌面模式插件。
 
 默认构建不需要游戏文件。依赖原版动作资源的震动播放和对应的震动设置桥接在默认构建中停用。如果你已有与本版本 SHA-256 匹配、并且有权在本机使用的资源包，可指定其本地路径后构建。
 
 ```sh
 GDM_MOTION_PACK=/path/to/genshin-native-motion.pck zsh build_genshin.sh
 ```
+
+指定资源包后，完整构建生成 `.build/GenshinDesktopMode_R46.dylib`。
 
 `test.sh` 运行不依赖游戏安装的测试。`tests/` 也保留了需要本地客户端或 macOS 界面环境的核对程序。
 

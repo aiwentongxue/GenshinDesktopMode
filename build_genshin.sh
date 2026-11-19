@@ -6,7 +6,7 @@ output_dir="${1:-$project_dir/.build}"
 mkdir -p "$output_dir"
 output_dir="$(cd "$output_dir" && pwd)"
 sdk_dir="$(xcrun --sdk macosx --show-sdk-path)"
-plugin_file="$output_dir/GenshinDesktopMode_R45.dylib"
+plugin_file="$output_dir/GenshinDesktopMode_R46_Basic.dylib"
 motion_flags=(-DGDM_EMBEDDED_MOTION_PACK=0)
 
 if [[ -n ${GDM_MOTION_PACK:-} ]]; then
@@ -21,6 +21,7 @@ if [[ -n ${GDM_MOTION_PACK:-} ]]; then
         printf 'Motion pack SHA-256 does not match this source revision.\n' >&2
         exit 1
     fi
+    plugin_file="$output_dir/GenshinDesktopMode_R46.dylib"
     motion_flags=(-DGDM_EMBEDDED_MOTION_PACK=1 -Xlinker -sectcreate
         -Xlinker __GDM -Xlinker __motion_pack -Xlinker "$motion_pack")
 fi
@@ -36,6 +37,6 @@ xcrun clang++ -dynamiclib -std=c++17 -O2 -fobjc-arc \
     -Wno-deprecated-declarations \
     -install_name '@rpath/libGenshinDesktopMode.dylib' \
     -o "$plugin_file" "$project_dir/genshin/probe.mm"
-codesign --force --sign - --identifier local.genshin.desktopmode.r45 "$plugin_file"
+codesign --force --sign - --identifier local.genshin.desktopmode.r46 "$plugin_file"
 codesign --verify --strict "$plugin_file"
 printf '%s\n' "$plugin_file"
