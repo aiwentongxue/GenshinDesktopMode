@@ -37,7 +37,7 @@ GDM_MOTION_PACK=/path/to/genshin-native-motion.pck zsh build_genshin.sh
 
 ## 许可证
 
-本项目整体采用 [GNU Affero General Public License v3.0 only](LICENSE)（SPDX 标识为 `AGPL-3.0-only`）。
+本项目整体采用 [GNU General Public License v3.0 only](LICENSE)（SPDX 标识为 `GPL-3.0-only`）。
 
 已按 MIT 许可发布的早期代码仍可按原许可使用。随本项目保留的原版权与许可声明见 [NOTICES](NOTICES)。
 
