@@ -10,6 +10,8 @@ Genshin Desktop Mode is a keyboard, mouse, and controller compatibility plugin f
 
 The fork uses a native gold pointer, yields to macOS menus and panels, and adds momentum to fast map drags. The title screen power button opens a native quit confirmation. New presses interrupt a coast. Mouse buttons held across an input-device switch must be released before the next click.
 
+[下载本分支的 R46-iven.1 Basic 版](https://github.com/aiwentongxue/GenshinDesktopMode/releases/tag/R46-iven.1)
+
 ## R46
 
 - 手柄类型和按键绑定由游戏识别。Xbox Series X 和 DualSense 可使用原生布局查看、修改按键，切换角色、交互和确认、取消也使用该布局。部分 DualSense 连接会显示游戏分配的 Xbox 键名。
