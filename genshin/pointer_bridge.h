@@ -11,6 +11,7 @@
 #include "native_web_escape.h"
 #include <cmath>
 #include "mac_pointer_host.h"
+#include "pointer_focus.h"
 #include "native_cursor.h"
 
 static std::atomic<int64_t> rawMotionX{0},rawMotionY{0};
@@ -33,6 +34,7 @@ namespace TitleQuit { static bool Handle(id window,id event,bool down); }
 static UIView *FindUnityView(UIView *view);
 static void UpdateCursorImage(const CGRect *eventBounds=nullptr, const CGPoint *eventPoint=nullptr);
 static void RefreshMacPointerHost(id eventWindow=nil);
+static bool GameOwnsMacEvent(id target);
 static void RefreshPointerStateNow(void);
 #include "native_account_input.h"
 static void UpdateNativeOverlayState(void);
@@ -251,7 +253,10 @@ static void SyncFreeDesktopPointer(const CGPoint *eventLocation=nullptr) {
     if(DefersMapPointerPacket() || (!eventLocation && desktopNativePressInContent &&
         NativeBridge::mapPageVisible.load())) return;
     if(ControllerOwnsGamePointer()) return;
-    if(!gameplayPointerStarted || pointerCaptureSuspended || !WantsVisibleCursor() || !NativeBridge::IsForeground()) return;
+    // Title-screen clicks arrive before the first camera lock.
+    if(pointerCaptureSuspended || nativePointerCaptured || NativeBridge::accountSheetActive ||
+       (!gameplayPointerStarted && NativeBridge::nativeOverlayActive) ||
+       (gameplayPointerStarted && !WantsVisibleCursor()) || !NativeBridge::IsForeground()) return;
     CGRect bounds;if(!GameContentBounds(bounds)) return;
     capturedPointer=eventLocation?*eventLocation:DesktopMouseLocation();
     if(desktopMapMotionBatched) {
@@ -404,10 +409,20 @@ static void SetMacPointerHost(id window) {
 static void RefreshMacPointerHost(id eventWindow) {
     id app = PointerApplication();
     id key = MacPointerSend(app, "keyWindow");
-    bool eligible = !menuTrackingDepth && MacPointerSend<BOOL>(app, "isActive") &&
-        !MacPointerSend(app, "modalWindow") && IsCatalystGameWindow(key);
-    if (eligible && eventWindow && eventWindow != key) eligible = false;
-    SetMacPointerHost(eligible ? key : nil);
+    id main = MacPointerSend(app, "mainWindow");
+    const auto focus = DesktopPointerFocus::owner(MacPointerSend<BOOL>(app, "isActive"),
+        menuTrackingDepth || MacPointerSend(app, "modalWindow"), key != nil, IsCatalystGameWindow(key),
+        !key && main && (main == eventWindow || (!eventWindow && main == gameHostWindow)) &&
+        IsCatalystGameWindow(main) && MacPointerSend<BOOL>(main, "isVisible"));
+    using Window = DesktopPointerFocus::Window;
+    SetMacPointerHost(focus == Window::key ? key : focus == Window::main ? main : nil);
+}
+
+static bool GameOwnsMacEvent(id target) {
+    // AppKit can address a tooltip while the game remains the key window.
+    if (!gameHostWindow || (target && target != gameHostWindow) || NativeBridge::macWindowSuspended.load())
+        RefreshMacPointerHost(target);
+    return NativeGameWindow() && (!target || target == gameHostWindow);
 }
 
 static void InstallMacPointerHost() {
@@ -499,6 +514,7 @@ static void ProcessDesktopScroll(id event,const DesktopScrollDispatchScope::Key 
 static bool DispatchOwnedMapMotion(id event,NSUInteger type);
 static id ProcessDesktopMouseMotion(id event) {
     NSUInteger type=((NSUInteger (*)(id,SEL))objc_msgSend)(event,sel_registerName("type"));
+    if(!GameOwnsMacEvent(MacPointerSend(event, "window"))) return event;
     if(DispatchOwnedMapMotion(event,type))return event;
     if(ControllerOwnsGamePointer() || pointerCaptureSuspended || !NativeBridge::IsForeground() || !NativeGameWindow()) return event;
     // The same event can cross NSApplication, NSWindow and local monitors.
@@ -553,16 +569,16 @@ static void ObservePrimaryEvent(id window,id event,NSUInteger type) {
         DesktopWebAppIsActive() && NativeBridge::IsForeground() && !NativeBridge::nativeOverlayActive;
     bool inside=false;
     DesktopPrimaryButton::Point point{};
-    if(game) {
-        CGRect content=NativeGameContentRect(window);
-        CGPoint local=((CGPoint (*)(id,SEL))objc_msgSend)(event,sel_registerName("locationInWindow"));
-        const auto [w,h]=NativeBridge::screenMetrics.read();
-        auto rect=DesktopGeometry::FitViewport({content.origin.x,content.origin.y,content.size.width,content.size.height},w,h);
-        if(rect.width>0 && rect.height>0) {
-            float u=(local.x-rect.x)/rect.width,v=(local.y-rect.y)/rect.height;
-            inside=u>=0 && u<1 && v>=0 && v<1;
-            point={u,v,!nativePointerCaptured && WantsVisibleCursor()};
-        }
+    CGRect bounds;
+    CGPoint location;
+    if(game && GameContentBounds(bounds)) {
+        location=GameMouseEventPoint(window,event);
+        inside=CGRectContainsPoint(bounds,location);
+        point={
+            static_cast<float>((location.x-bounds.origin.x)/bounds.size.width),
+            static_cast<float>(1.0-(location.y-bounds.origin.y)/bounds.size.height),
+            !nativePointerCaptured && (!gameplayPointerStarted || WantsVisibleCursor())
+        };
     }
     NSUInteger flags=((NSUInteger (*)(id,SEL))objc_msgSend)(event,sel_registerName("modifierFlags"));
     bool eligible=inside && !(flags&(1ULL<<20));
@@ -570,19 +586,16 @@ static void ObservePrimaryEvent(id window,id event,NSUInteger type) {
         desktopMapFrame.cancel();
         desktopNativePressInContent=eligible;
     } else if(game && point.valid && desktopNativePressInContent) {
-        // Pin the final event before the OS moves the free cursor again.
         desktopMapFrame.cancel();
-        CGPoint location=GameMouseEventPoint(window,event);
-        SyncFreeDesktopPointer(&location);
     }
+    // Both edges carry the location AppKit recorded for this event.
+    if(point.valid && (down ? eligible : desktopNativePressInContent)) SyncFreeDesktopPointer(&location);
     if(!down && !game && desktopNativePressInContent) NativeBridge::CancelDesktopPointer();
     NativeBridge::PrimaryEvent(down,eligible,point);
 }
 static void DispatchDesktopWindowEvent(id window,SEL selector,id event) {
     NSUInteger type=((NSUInteger (*)(id,SEL))objc_msgSend)(event,sel_registerName("type"));
-    id target = window;
-    if (target != gameHostWindow || NativeBridge::macWindowSuspended.load()) RefreshMacPointerHost(target);
-    if (!NativeGameWindow() || (target && target != gameHostWindow)) {
+    if (!GameOwnsMacEvent(window)) {
         originalWindowSendEvent(window, selector, event);
         return;
     }
@@ -654,8 +667,11 @@ static bool DispatchOwnedMapMotion(id event,NSUInteger type) {
 static void DispatchDesktopApplicationEvent(id application,SEL selector,id event) {
     NSUInteger type=((NSUInteger (*)(id,SEL))objc_msgSend)(event,sel_registerName("type"));
     id target = MacPointerSend(event, "window");
-    if (target != gameHostWindow || NativeBridge::macWindowSuspended.load()) RefreshMacPointerHost(target);
-    if (!NativeGameWindow() || (target && target != gameHostWindow)) {
+    if (!GameOwnsMacEvent(target)) {
+        if (type==2 && desktopNativePressInContent) {
+            desktopNativePressInContent=false;
+            NativeBridge::CancelDesktopPointer();
+        }
         originalApplicationSendEvent(application, selector, event);
         return;
     }

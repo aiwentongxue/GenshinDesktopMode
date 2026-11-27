@@ -98,6 +98,7 @@ static void SuppressNoticeEscape(void) {
 }
 static void CancelMouseLocked(void) {
     primaryButton.cancel();
+    hasPointerPosition=false;
     mouseButtons.fill(false);
     mouseReleasePending=true;
     physicalMouseSnapshot=0;
@@ -251,7 +252,7 @@ static void Update(char *manager) {
         mosScroll=scroll.usingMos();
         sx=(float)wheel.x;sy=(float)wheel.y;
         px=normalizedX;py=normalizedY;positioned=hasPointerPosition;
-        if(primaryUsesEvents && mouseOwned && foreground && !nativeOverlayActive) {
+        if(primaryUsesEvents && !mouseReleasePending && mouseOwned && foreground && !nativeOverlayActive) {
             auto frame=primaryButton.frame((rawMouse&1u)!=0);
             mouseButtons[0]=frame.down;
             if(frame.position.valid) {px=frame.position.x;py=frame.position.y;positioned=true;}
@@ -280,6 +281,17 @@ static void Update(char *manager) {
         if (count<=8) Log(@"keyboard_frame_forwarded pressed=%d engine_readback=%d",
             event.second,EngineFunction<bool (*)(int)>(0x10e864028)(event.first));
     }
+    const auto pixels=screenMetrics.read();
+    // Match the position to the button edge before Unity handles it, then
+    // restore the same position if Unity refreshed the cursor during polling.
+    auto publishPointerPosition = [&] {
+        if (mouseOwned && pointerRevision==mapFocusRevision.load() && foreground &&
+            positioned && pixels.width && pixels.height) {
+            *(float *)(manager+0xd0)=px*pixels.width;
+            *(float *)(manager+0xd4)=py*pixels.height;
+        }
+    };
+    publishPointerPosition();
     originalUpdate(manager);
     if(IsModernRuntime()) {
         unsigned engine=0,held=0;unsigned mask=1;
@@ -323,14 +335,7 @@ static void Update(char *manager) {
             previousLeft=buttons[0];
         }
     }
-    const auto pixels=screenMetrics.read();
-    if (mouseOwned && pointerRevision==mapFocusRevision.load() && foreground && positioned && pixels.width && pixels.height) {
-        // One position drives both the visible cursor and Unity hit testing.
-        // Camera motion uses the axis accumulators, never an unbounded second
-        // absolute cursor that could reappear at a different location.
-        *(float *)(manager+0xd0)=px*pixels.width;
-        *(float *)(manager+0xd4)=py*pixels.height;
-    }
+    publishPointerPosition();
     ++frames;
     if (x || y || sx || sy) {
         auto frame=++forwardedMouseFrames;
