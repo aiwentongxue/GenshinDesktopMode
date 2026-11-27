@@ -4,6 +4,12 @@
 
 Genshin Desktop Mode is a keyboard, mouse, and controller compatibility plugin for the iOS version of Genshin Impact running through PlayCover on Apple Silicon Macs.
 
+## R46-iven.1
+
+登录和游戏菜单由 macOS 绘制金色光标，原生菜单及弹窗接管系统指针。登录页左下角的电源按钮可确认退出游戏。按 M 打开地图，快速拖动后松手可沿拖动方向滑行，再次按下可打断滑行。切换输入设备时，松开之前已按住的鼠标键即可开始新的点击。
+
+The fork uses a native gold pointer, yields to macOS menus and panels, and adds momentum to fast map drags. The title screen power button opens a native quit confirmation. New presses interrupt a coast. Mouse buttons held across an input-device switch must be released before the next click.
+
 ## R46
 
 - 手柄类型和按键绑定由游戏识别。Xbox Series X 和 DualSense 可使用原生布局查看、修改按键，切换角色、交互和确认、取消也使用该布局。部分 DualSense 连接会显示游戏分配的 Xbox 键名。
